@@ -1,20 +1,21 @@
-// src/pingEngine.js — Production-grade ICMP ping engine
-// Windows ICMP ping | 40 routers per batch | 3 retries | 30s interval
+// src/pingEngine.js — Production ICMP ping engine v2
+// Windows ICMP ping | 40 routers per batch | countdown-based down detection
+// | batched DB writes (1 query for status, 1 for history per cycle)
 
 require('dotenv').config();
 const ping = require('ping');
 const { query } = require('./db');
 
-const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS) || 30000;
-const BATCH_SIZE       = parseInt(process.env.PING_BATCH_SIZE)  || 40;
-const MAX_RETRIES      = parseInt(process.env.PING_MAX_RETRIES) || 3;
-const PING_TIMEOUT_S   = Math.floor((parseInt(process.env.PING_TIMEOUT_MS) || 3000) / 1000);
+const PING_INTERVAL_MS     = parseInt(process.env.PING_INTERVAL_MS)     || 30000;
+const BATCH_SIZE           = parseInt(process.env.PING_BATCH_SIZE)      || 40;
+const COUNTDOWN_THRESHOLD  = parseInt(process.env.COUNTDOWN_THRESHOLD)  || 10;
+const PING_TIMEOUT_S       = Math.floor((parseInt(process.env.PING_TIMEOUT_MS) || 3000) / 1000);
 
-// In-memory state for each router (keyed by ip_address)
-// { upTime, downTime, status, retries, lastCycleUp }
+// In-memory state per router (keyed by ip_address)
+// { upTime, downTime, status, countdown }
 const routerState = {};
 
-// ─── Ping a single IP with Windows ICMP ─────────────────────────────────────
+// ─── Ping a single IP with Windows ICMP (single attempt, no retry) ──────────
 async function pingOne(ip) {
   try {
     const res = await ping.promise.probe(ip, {
@@ -27,96 +28,99 @@ async function pingOne(ip) {
   }
 }
 
-// ─── Ping with up to MAX_RETRIES attempts ────────────────────────────────────
-async function pingWithRetry(ip) {
-  // First attempt
-  const firstTry = await pingOne(ip);
-  if (firstTry) return { alive: true, retries: 0 };
-
-  // Up to MAX_RETRIES-1 more attempts (total = MAX_RETRIES)
-  for (let attempt = 1; attempt < MAX_RETRIES; attempt++) {
-    const result = await pingOne(ip);
-    if (result) return { alive: true, retries: attempt };
-  }
-  return { alive: false, retries: MAX_RETRIES };
-}
-
-// ─── Ping a batch of routers concurrently ───────────────────────────────────
+// ─── Ping a batch of routers concurrently (1 attempt each) ──────────────────
 async function pingBatch(routers) {
   return Promise.all(
     routers.map(async (router) => {
-      const { alive, retries } = await pingWithRetry(router.ip_address);
-      return { ...router, alive, retries };
+      const alive = await pingOne(router.ip_address);
+      return { bts_name: router.bts_name, ip_address: router.ip_address, alive };
     })
   );
 }
 
-// ─── Calculate 24h uptime / downtime ────────────────────────────────────────
-async function getUpTimeLast24h(ip) {
-  const sql = `
-    SELECT COALESCE(SUM(
-      CASE WHEN status = 'Up' THEN 30 ELSE 0 END
-    ), 0) AS total_up
-    FROM ping_history
-    WHERE ip_address = $1
-      AND checked_at >= NOW() - INTERVAL '24 hours'
-  `;
-  const res = await query(sql, [ip]);
-  return parseInt(res.rows[0].total_up) || 0;
-}
-
-async function getDownTimeLast24h(ip) {
-  const sql = `
-    SELECT COALESCE(SUM(
-      CASE WHEN status = 'Down' THEN 30 ELSE 0 END
-    ), 0) AS total_down
-    FROM ping_history
-    WHERE ip_address = $1
-      AND checked_at >= NOW() - INTERVAL '24 hours'
-  `;
-  const res = await query(sql, [ip]);
-  return parseInt(res.rows[0].total_down) || 0;
-}
-
-// ─── Update router state and write to DB ────────────────────────────────────
-async function processResult(router, alive, retries) {
-  const ip  = router.ip_address;
-  const bts = router.bts_name;
-
-  // Initialise state if first time seen
+// ─── Update in-memory state using countdown logic ───────────────────────────
+//
+//  alive=true:
+//    countdown = 0, status = 'Up', up_time += 30, down_time = 0
+//
+//  alive=false:
+//    countdown += 1 (capped at COUNTDOWN_THRESHOLD)
+//    if countdown < THRESHOLD  → still shows 'Up' (grace period)
+//                                 up_time += 30, down_time = 0
+//    if countdown == THRESHOLD → status = 'Down' (confirmed)
+//                                 down_time += 30, up_time = 0
+//                                 countdown stays frozen at THRESHOLD
+//
+function updateState(ip, alive) {
   if (!routerState[ip]) {
-    routerState[ip] = { upTime: 0, downTime: 0, status: 'Unknown', retries: 0 };
+    routerState[ip] = { upTime: 0, downTime: 0, status: 'Unknown', countdown: 0 };
   }
-  const state = routerState[ip];
+  const s = routerState[ip];
 
-  // ── Update upTime / downTime accumulators ──
   if (alive) {
-    state.upTime   += 30;   // grows by 30s each ping cycle
-    state.downTime  = 0;    // reset when back up
-    state.status    = 'Up';
+    s.countdown = 0;
+    s.status    = 'Up';
+    s.upTime   += 30;
+    s.downTime  = 0;
   } else {
-    state.downTime += 30;   // grows by 30s each failed cycle
-    state.upTime    = 0;    // reset when down
-    state.status    = 'Down';
+    if (s.countdown < COUNTDOWN_THRESHOLD) s.countdown += 1;
+
+    if (s.countdown < COUNTDOWN_THRESHOLD) {
+      // grace period — still reported as Up
+      s.status    = 'Up';
+      s.upTime   += 30;
+      s.downTime  = 0;
+    } else {
+      // confirmed down
+      s.status    = 'Down';
+      s.downTime += 30;
+      s.upTime    = 0;
+    }
   }
-  state.retries = retries;
+  return s;
+}
 
-  // ── Compute 24h totals ──
-  const [upLast24h, downLast24h] = await Promise.all([
-    getUpTimeLast24h(ip),
-    getDownTimeLast24h(ip),
-  ]);
+// ─── Get 24h up/down sums for ALL routers in ONE query ──────────────────────
+async function get24hSumsForAll() {
+  const sql = `
+    SELECT
+      ip_address,
+      COALESCE(SUM(CASE WHEN status = 'Up'   THEN 30 ELSE 0 END), 0) AS up24,
+      COALESCE(SUM(CASE WHEN status = 'Down' THEN 30 ELSE 0 END), 0) AS down24
+    FROM ping_history
+    WHERE checked_at >= NOW() - INTERVAL '24 hours'
+    GROUP BY ip_address
+  `;
+  const res = await query(sql);
+  const map = new Map();
+  for (const row of res.rows) {
+    map.set(row.ip_address, {
+      up24:   parseInt(row.up24),
+      down24: parseInt(row.down24),
+    });
+  }
+  return map;
+}
 
-  // Add this cycle's contribution to 24h totals
-  const upTime24h   = upLast24h   + (alive ? 30 : 0);
-  const downTime24h = downLast24h + (alive ? 0 : 30);
+// ─── Build one multi-row UPSERT for router_status ────────────────────────────
+function buildBatchUpsertStatus(rows) {
+  const cols = [
+    'bts_name', 'ip_address', 'up_time', 'down_time',
+    'up_time_last_24h', 'down_time_last_24h', 'status', 'countdown',
+  ];
+  const valuesSql = [];
+  const params = [];
 
-  // ── Upsert router_status (live table) ──
-  const upsertSQL = `
-    INSERT INTO router_status
-      (bts_name, ip_address, up_time, down_time,
-       up_time_last_24h, down_time_last_24h, status, retries, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+  rows.forEach((row, i) => {
+    const base = i * cols.length;
+    const placeholders = cols.map((_, j) => `$${base + j + 1}`);
+    valuesSql.push(`(${placeholders.join(',')}, NOW())`);
+    cols.forEach(c => params.push(row[c]));
+  });
+
+  const sql = `
+    INSERT INTO router_status (${cols.join(',')}, updated_at)
+    VALUES ${valuesSql.join(',')}
     ON CONFLICT (ip_address) DO UPDATE SET
       bts_name           = EXCLUDED.bts_name,
       up_time            = EXCLUDED.up_time,
@@ -124,32 +128,32 @@ async function processResult(router, alive, retries) {
       up_time_last_24h   = EXCLUDED.up_time_last_24h,
       down_time_last_24h = EXCLUDED.down_time_last_24h,
       status             = EXCLUDED.status,
-      retries            = EXCLUDED.retries,
+      countdown          = EXCLUDED.countdown,
       updated_at         = NOW()
   `;
-  await query(upsertSQL, [
-    bts, ip,
-    state.upTime, state.downTime,
-    upTime24h, downTime24h,
-    state.status, state.retries
-  ]);
+  return { sql, params };
+}
 
-  // ── Insert into ping_history (TimescaleDB hypertable) ──
-  const histSQL = `
-    INSERT INTO ping_history
-      (bts_name, ip_address, up_time, down_time,
-       up_time_last_24h, down_time_last_24h, status, retries, checked_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-  `;
-  await query(histSQL, [
-    bts, ip,
-    state.upTime, state.downTime,
-    upTime24h, downTime24h,
-    state.status, state.retries
-  ]);
+// ─── Build one multi-row INSERT for ping_history ─────────────────────────────
+function buildBatchInsertHistory(rows, timestamp) {
+  const cols = [
+    'bts_name', 'ip_address', 'up_time', 'down_time',
+    'up_time_last_24h', 'down_time_last_24h', 'status', 'countdown', 'checked_at',
+  ];
+  const valuesSql = [];
+  const params = [];
 
-  const symbol = alive ? '✔' : '✘';
-  console.log(`[PING] ${symbol} ${bts} (${ip}) | status=${state.status} | up=${state.upTime}s | down=${state.downTime}s | retries=${retries}`);
+  rows.forEach((row, i) => {
+    const base = i * cols.length;
+    const placeholders = cols.map((_, j) => `$${base + j + 1}`);
+    valuesSql.push(`(${placeholders.join(',')})`);
+    cols.forEach(c => {
+      params.push(c === 'checked_at' ? timestamp : row[c]);
+    });
+  });
+
+  const sql = `INSERT INTO ping_history (${cols.join(',')}) VALUES ${valuesSql.join(',')}`;
+  return { sql, params };
 }
 
 // ─── Load all routers from DB ────────────────────────────────────────────────
@@ -175,38 +179,81 @@ async function runPingCycle() {
     return;
   }
 
-  console.log(`\n[PING ENGINE] ── Cycle start | ${routers.length} routers | ${new Date().toISOString()}`);
+  const cycleTimestamp = new Date();
+  console.log(`\n[PING ENGINE] ── Cycle start | ${routers.length} routers | ${cycleTimestamp.toISOString()}`);
 
-  // Split into batches of BATCH_SIZE
-  const batches = [];
+  // ── Ping all routers in batches of BATCH_SIZE ──
+  const allResults = [];
   for (let i = 0; i < routers.length; i += BATCH_SIZE) {
-    batches.push(routers.slice(i, i + BATCH_SIZE));
+    const batch = routers.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(routers.length / BATCH_SIZE);
+    console.log(`[PING ENGINE] Batch ${batchNum}/${totalBatches} | ${batch.length} routers`);
+    const results = await pingBatch(batch);
+    allResults.push(...results);
   }
 
-  for (let b = 0; b < batches.length; b++) {
-    const batch = batches[b];
-    console.log(`[PING ENGINE] Batch ${b + 1}/${batches.length} | ${batch.length} routers`);
-    const results = await pingBatch(batch);
-    // Process DB writes concurrently within the batch
-    await Promise.all(results.map(r => processResult(r, r.alive, r.retries)));
+  // ── Get 24h sums for all routers in ONE query ──
+  let sums;
+  try {
+    sums = await get24hSumsForAll();
+  } catch (err) {
+    console.error('[PING ENGINE] Failed to get 24h sums:', err.message);
+    sums = new Map();
+  }
+
+  // ── Update in-memory state + build row objects ──
+  const rows = allResults.map(r => {
+    const state = updateState(r.ip_address, r.alive);
+    const sum = sums.get(r.ip_address) || { up24: 0, down24: 0 };
+    const up24h   = sum.up24   + (state.status === 'Up'   ? 30 : 0);
+    const down24h = sum.down24 + (state.status === 'Down' ? 30 : 0);
+
+    const symbol = r.alive ? '✔' : '✘';
+    console.log(`[PING] ${symbol} ${r.bts_name} (${r.ip_address}) | status=${state.status} | up=${state.upTime}s | down=${state.downTime}s | countdown=${state.countdown}`);
+
+    return {
+      bts_name:           r.bts_name,
+      ip_address:         r.ip_address,
+      up_time:            state.upTime,
+      down_time:          state.downTime,
+      up_time_last_24h:   up24h,
+      down_time_last_24h: down24h,
+      status:             state.status,
+      countdown:          state.countdown,
+    };
+  });
+
+  // ── ONE batch write to router_status ──
+  try {
+    const { sql, params } = buildBatchUpsertStatus(rows);
+    await query(sql, params);
+  } catch (err) {
+    console.error('[PING ENGINE] Batch upsert (router_status) failed:', err.message);
+  }
+
+  // ── ONE batch write to ping_history ──
+  try {
+    const { sql, params } = buildBatchInsertHistory(rows, cycleTimestamp);
+    await query(sql, params);
+  } catch (err) {
+    console.error('[PING ENGINE] Batch insert (ping_history) failed:', err.message);
   }
 
   const elapsed = ((Date.now() - cycleStart) / 1000).toFixed(1);
-  console.log(`[PING ENGINE] ── Cycle done in ${elapsed}s\n`);
+  console.log(`[PING ENGINE] ── Cycle done in ${elapsed}s (2 DB writes total)\n`);
 }
 
 // ─── Start the engine ────────────────────────────────────────────────────────
 async function start() {
   console.log('[PING ENGINE] Starting...');
-  console.log(`  Interval : ${PING_INTERVAL_MS / 1000}s`);
-  console.log(`  Batch    : ${BATCH_SIZE} routers`);
-  console.log(`  Retries  : ${MAX_RETRIES}`);
-  console.log(`  Timeout  : ${PING_TIMEOUT_S}s per ping`);
+  console.log(`  Interval           : ${PING_INTERVAL_MS / 1000}s`);
+  console.log(`  Batch size         : ${BATCH_SIZE} routers`);
+  console.log(`  Countdown threshold: ${COUNTDOWN_THRESHOLD} cycles (= ${(COUNTDOWN_THRESHOLD * PING_INTERVAL_MS) / 1000}s to confirm Down)`);
+  console.log(`  Ping timeout       : ${PING_TIMEOUT_S}s per ping`);
 
-  // Run immediately on start
   await runPingCycle();
 
-  // Then repeat every PING_INTERVAL_MS
   setInterval(async () => {
     try {
       await runPingCycle();
@@ -218,7 +265,6 @@ async function start() {
 
 module.exports = { start };
 
-// Allow running standalone: node src/pingEngine.js
 if (require.main === module) {
   const { testConnection } = require('./db');
   testConnection().then(ok => {

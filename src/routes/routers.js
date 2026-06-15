@@ -1,4 +1,4 @@
-// src/routes/routers.js — All API routes
+// src/routes/routers.js — Core router CRUD + status APIs
 
 const express = require('express');
 const router  = express.Router();
@@ -19,7 +19,7 @@ router.get('/status/down', async (req, res) => {
       SELECT r.bts_name, r.ip_address,
         s.up_time, s.down_time,
         s.up_time_last_24h, s.down_time_last_24h,
-        s.status, s.retries, s.updated_at
+        s.status, s.countdown, s.updated_at
       FROM routers r
       JOIN router_status s ON r.ip_address = s.ip_address
       WHERE s.status = 'Down'
@@ -37,7 +37,7 @@ router.get('/status/up', async (req, res) => {
       SELECT r.bts_name, r.ip_address,
         s.up_time, s.down_time,
         s.up_time_last_24h, s.down_time_last_24h,
-        s.status, s.retries, s.updated_at
+        s.status, s.countdown, s.updated_at
       FROM routers r
       JOIN router_status s ON r.ip_address = s.ip_address
       WHERE s.status = 'Up'
@@ -58,7 +58,7 @@ router.get('/', async (req, res) => {
         COALESCE(s.up_time_last_24h,   0) AS up_time_last_24h,
         COALESCE(s.down_time_last_24h, 0) AS down_time_last_24h,
         COALESCE(s.status,       'Unknown') AS status,
-        COALESCE(s.retries,            0) AS retries,
+        COALESCE(s.countdown,          0) AS countdown,
         s.updated_at
       FROM routers r
       LEFT JOIN router_status s ON r.ip_address = s.ip_address
@@ -103,7 +103,7 @@ router.get('/:ip/history', async (req, res) => {
     const sql = `
       SELECT bts_name, ip_address, up_time, down_time,
         up_time_last_24h, down_time_last_24h,
-        status, retries, checked_at
+        status, countdown, checked_at
       FROM ping_history
       WHERE ip_address = $1
       ORDER BY checked_at DESC
@@ -121,6 +121,63 @@ router.get('/:ip/history', async (req, res) => {
   } catch (err) { serverError(res, err); }
 });
 
+// 9. GET /api/routers/:ip/last-events
+// Returns a list of every cycle's LAST record (status transitions).
+router.get('/:ip/last-events', async (req, res) => {
+  const ip   = req.params.ip;
+  const limit  = parseInt(req.query.limit) || 100;
+  const page   = parseInt(req.query.page)  || 1;
+  const offset = (page - 1) * limit;
+
+  try {
+    const check = await query('SELECT bts_name FROM routers WHERE ip_address = $1', [ip]);
+    if (check.rowCount === 0) return notFound(res, ip);
+    const bts_name = check.rows[0].bts_name;
+
+    const countSQL = `
+      WITH ranked AS (
+        SELECT status, checked_at,
+          LEAD(status) OVER (ORDER BY checked_at ASC) AS next_status
+        FROM ping_history
+        WHERE ip_address = $1
+      )
+      SELECT COUNT(*) AS total
+      FROM ranked
+      WHERE next_status IS NULL OR next_status <> status
+    `;
+    const countRes = await query(countSQL, [ip]);
+    const total = parseInt(countRes.rows[0].total);
+
+    const sql = `
+      WITH ranked AS (
+        SELECT bts_name, ip_address, up_time, down_time,
+          up_time_last_24h, down_time_last_24h,
+          status, countdown, checked_at,
+          LEAD(status) OVER (ORDER BY checked_at ASC) AS next_status
+        FROM ping_history
+        WHERE ip_address = $1
+      )
+      SELECT bts_name, ip_address, up_time, down_time,
+        up_time_last_24h, down_time_last_24h,
+        status, countdown, checked_at
+      FROM ranked
+      WHERE next_status IS NULL OR next_status <> status
+      ORDER BY checked_at DESC
+      LIMIT $2 OFFSET $3
+    `;
+    const result = await query(sql, [ip, limit, offset]);
+
+    res.json({
+      success: true,
+      bts_name,
+      ip_address: ip,
+      total, page, limit,
+      pages: Math.ceil(total / limit),
+      cycles: result.rows,
+    });
+  } catch (err) { serverError(res, err); }
+});
+
 // 6. GET /api/routers/:ip — Single router
 router.get('/:ip', async (req, res) => {
   const ip = req.params.ip;
@@ -132,7 +189,7 @@ router.get('/:ip', async (req, res) => {
         COALESCE(s.up_time_last_24h,   0) AS up_time_last_24h,
         COALESCE(s.down_time_last_24h, 0) AS down_time_last_24h,
         COALESCE(s.status,       'Unknown') AS status,
-        COALESCE(s.retries,            0) AS retries,
+        COALESCE(s.countdown,          0) AS countdown,
         s.updated_at
       FROM routers r
       LEFT JOIN router_status s ON r.ip_address = s.ip_address
@@ -174,87 +231,8 @@ router.delete('/:ip', async (req, res) => {
     await query('DELETE FROM ping_history  WHERE ip_address = $1', [ip]);
     await query('DELETE FROM router_status WHERE ip_address = $1', [ip]);
     await query('DELETE FROM routers       WHERE ip_address = $1', [ip]);
+    await query('DELETE FROM daily_summary WHERE ip_address = $1', [ip]);
     res.json({ success: true, message: `Router ${ip} and all its history deleted` });
-  } catch (err) { serverError(res, err); }
-});
-
-//  9. GET /api/routers/:ip/last-events
-router.get('/:ip/last-events', async (req, res) => {
-  const ip   = req.params.ip;
-  const limit  = parseInt(req.query.limit) || 100;  // default 100 cycles
-  const page   = parseInt(req.query.page)  || 1;
-  const offset = (page - 1) * limit;
-
-  try {
-    const check = await query('SELECT bts_name FROM routers WHERE ip_address = $1', [ip]);
-    if (check.rowCount === 0) return notFound(res, ip);
-    const bts_name = check.rows[0].bts_name;
-
-    // ── Count total cycles for pagination ────────────────
-    const countSQL = `
-      WITH ranked AS (
-        SELECT
-          status,
-          checked_at,
-          LEAD(status) OVER (ORDER BY checked_at ASC) AS next_status
-        FROM ping_history
-        WHERE ip_address = $1
-      )
-      SELECT COUNT(*) AS total
-      FROM ranked
-      WHERE next_status IS NULL OR next_status <> status
-    `;
-    const countRes = await query(countSQL, [ip]);
-    const total = parseInt(countRes.rows[0].total);
-
-    // ── Fetch cycle end records with pagination ───────────
-    const sql = `
-      WITH ranked AS (
-        SELECT
-          bts_name,
-          ip_address,
-          up_time,
-          down_time,
-          up_time_last_24h,
-          down_time_last_24h,
-          status,
-          retries,
-          checked_at,
-          LEAD(status) OVER (ORDER BY checked_at ASC) AS next_status
-        FROM ping_history
-        WHERE ip_address = $1
-      )
-      SELECT
-        bts_name,
-        ip_address,
-        up_time,
-        down_time,
-        up_time_last_24h,
-        down_time_last_24h,
-        status,
-        retries,
-        checked_at
-      FROM ranked
-      WHERE
-        next_status IS NULL
-        OR next_status <> status
-      ORDER BY checked_at DESC
-      LIMIT $2 OFFSET $3
-    `;
-
-    const result = await query(sql, [ip, limit, offset]);
-
-    res.json({
-      success:    true,
-      bts_name,
-      ip_address: ip,
-      total,
-      page,
-      limit,
-      pages:      Math.ceil(total / limit),
-      cycles:     result.rows,
-    });
-
   } catch (err) { serverError(res, err); }
 });
 

@@ -7,6 +7,7 @@ const morgan     = require('morgan');
 const rateLimit  = require('express-rate-limit');
 const { testConnection } = require('./db');
 const routerRoutes = require('./routes/routers');
+const analyticsRoutes = require('./routes/analytics');
 const pingEngine   = require('./pingEngine');
 
 const app  = express();
@@ -29,6 +30,7 @@ app.use('/api', limiter);
 
 // ── Routes ────────────────────────────────────
 app.use('/api/routers', routerRoutes);
+app.use('/api', analyticsRoutes);  // /api/ask, /api/analytics/*
 
 // Health check
 app.get('/health', (req, res) => {
