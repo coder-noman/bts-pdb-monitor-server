@@ -46,3 +46,25 @@ Content-Type: application/json
 Run daily summary:
 POST http://localhost:3000/api/analytics/run-daily-summary?date=2026-06-08
 (No body needed)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+TRUNCATE TABLE ping_history, router_status, daily_summary;

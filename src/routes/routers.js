@@ -122,7 +122,8 @@ router.get('/:ip/history', async (req, res) => {
 });
 
 // 9. GET /api/routers/:ip/last-events
-// Returns a list of every cycle's LAST record (status transitions).
+// Returns a list of every cycle (continuous Up streak or Down streak)
+// with started_at and ended_at (ended_at is null for the ongoing cycle).
 router.get('/:ip/last-events', async (req, res) => {
   const ip   = req.params.ip;
   const limit  = parseInt(req.query.limit) || 100;
@@ -134,6 +135,7 @@ router.get('/:ip/last-events', async (req, res) => {
     if (check.rowCount === 0) return notFound(res, ip);
     const bts_name = check.rows[0].bts_name;
 
+    // ── Count total cycles ──────────────────────────────
     const countSQL = `
       WITH ranked AS (
         SELECT status, checked_at,
@@ -148,24 +150,66 @@ router.get('/:ip/last-events', async (req, res) => {
     const countRes = await query(countSQL, [ip]);
     const total = parseInt(countRes.rows[0].total);
 
+    // ── Find cycle starts (LAG) and cycle ends (LEAD), ──
+    // ── pair the Nth start with the Nth end (cycles ────
+    // ── alternate Up/Down strictly, so this pairing is ──
+    // ── always correct) ─────────────────────────────────
     const sql = `
       WITH ranked AS (
         SELECT bts_name, ip_address, up_time, down_time,
           up_time_last_24h, down_time_last_24h,
           status, countdown, checked_at,
+          LAG(status)  OVER (ORDER BY checked_at ASC) AS prev_status,
           LEAD(status) OVER (ORDER BY checked_at ASC) AS next_status
         FROM ping_history
         WHERE ip_address = $1
+      ),
+      cycle_starts AS (
+        SELECT
+          checked_at AS started_at,
+          ROW_NUMBER() OVER (ORDER BY checked_at ASC) AS rn
+        FROM ranked
+        WHERE prev_status IS NULL OR prev_status <> status
+      ),
+      cycle_ends AS (
+        SELECT
+          bts_name, ip_address, up_time, down_time,
+          up_time_last_24h, down_time_last_24h,
+          status, countdown,
+          checked_at AS ended_at,
+          next_status,
+          ROW_NUMBER() OVER (ORDER BY checked_at ASC) AS rn
+        FROM ranked
+        WHERE next_status IS NULL OR next_status <> status
       )
-      SELECT bts_name, ip_address, up_time, down_time,
-        up_time_last_24h, down_time_last_24h,
-        status, countdown, checked_at
-      FROM ranked
-      WHERE next_status IS NULL OR next_status <> status
-      ORDER BY checked_at DESC
+      SELECT
+        ce.bts_name, ce.ip_address,
+        ce.up_time, ce.down_time,
+        ce.up_time_last_24h, ce.down_time_last_24h,
+        ce.status, ce.countdown,
+        cs.started_at,
+        CASE WHEN ce.next_status IS NULL THEN NULL ELSE ce.ended_at END AS ended_at,
+        (ce.next_status IS NULL) AS ongoing
+      FROM cycle_ends ce
+      JOIN cycle_starts cs ON cs.rn = ce.rn
+      ORDER BY ce.ended_at DESC
       LIMIT $2 OFFSET $3
     `;
     const result = await query(sql, [ip, limit, offset]);
+
+    // ── Build final cycle objects ────────────────────────
+    const cycles = result.rows.map(row => ({
+      bts_name:           row.bts_name,
+      ip_address:         row.ip_address,
+      up_time:            row.up_time,
+      down_time:          row.down_time,
+      up_time_last_24h:   row.up_time_last_24h,
+      down_time_last_24h: row.down_time_last_24h,
+      status:             row.status,
+      countdown:          row.countdown,
+      started_at:         row.started_at,
+      ended_at:           row.ended_at,
+    }));
 
     res.json({
       success: true,
@@ -173,7 +217,7 @@ router.get('/:ip/last-events', async (req, res) => {
       ip_address: ip,
       total, page, limit,
       pages: Math.ceil(total / limit),
-      cycles: result.rows,
+      cycles,
     });
   } catch (err) { serverError(res, err); }
 });
