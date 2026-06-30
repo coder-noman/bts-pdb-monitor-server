@@ -32,6 +32,11 @@ GET     http://localhost:3000/api/analytics/daily-breakdown/10.200.205.162?days=
 GET     http://localhost:3000/api/analytics/daily-breakdown/10.200.205.162?days=30
 
 
+Date Wise Analytics
+http://localhost:3000/api/analytics/date/2026-06-16
+http://localhost:3000/api/analytics/date/2026-06-16/10.200.205.2
+http://localhost:3000/api/analytics/range/10.200.205.2?start=2026-06-15&end=2026-06-16
+
 Natural Language Query
 POST    http://localhost:3000/api/ask
 Body (JSON): { "question": "how many BTS are down right now?" }

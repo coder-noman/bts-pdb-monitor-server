@@ -419,39 +419,195 @@ router.get('/analytics/report/excel/30d', async (req, res) => {
   } catch (err) { serverError(res, err); }
 });
 
-
 // ══════════════════════════════════════════════════════════
-//  4. GET /api/analytics/daily-breakdown/:ip?days=7|30
+//  CORE DAILY JOB — runs automatically every night (see
+//  src/scheduler.js) and can still be triggered manually.
+//
+//  For ONE calendar date, computes and stores:
+//    1. daily_summary  — one row per router: totals + %
+//    2. daily_events    — one row per Up/Down cycle that
+//                          happened on that date (transition
+//                          records, same idea as /last-events
+//                          but pre-computed & permanent)
+//
+//  Re-running for the same date is always safe — both tables
+//  use ON CONFLICT / DELETE+INSERT so old data is overwritten,
+//  never duplicated.
 // ══════════════════════════════════════════════════════════
-router.get('/analytics/daily-breakdown/:ip', async (req, res) => {
-  const ip   = req.params.ip;
-  const days = parseInt(req.query.days) || 7;
-  try {
-    const check = await query('SELECT bts_name FROM routers WHERE ip_address = $1', [ip]);
-    if (check.rowCount === 0) return notFound(res, ip);
+async function runDailyJob(targetDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+    throw new Error('date must be YYYY-MM-DD');
+  }
 
-    const sql = `
-      SELECT summary_date, bts_name, ip_address,
-        up_seconds, down_seconds, down_incidents,
-        uptime_pct, downtime_pct
-      FROM daily_summary
-      WHERE ip_address = $1
-      ORDER BY summary_date DESC
-      LIMIT $2
-    `;
-    const result = await query(sql, [ip, days]);
-    res.json({
-      success:   true,
-      bts_name:  check.rows[0].bts_name,
-      ip_address: ip,
-      count:     result.rowCount,
-      days:      result.rows,
+  const startTs = `${targetDate}T00:00:00.000Z`;
+  const endTs   = `${targetDate}T23:59:59.999Z`;
+
+  // ── PART A — daily_summary (totals per router) ─────────
+  const statsSQL = `
+    SELECT ip_address, bts_name,
+      COALESCE(SUM(CASE WHEN status = 'Up'   THEN 30 ELSE 0 END), 0) AS up_seconds,
+      COALESCE(SUM(CASE WHEN status = 'Down' THEN 30 ELSE 0 END), 0) AS down_seconds
+    FROM ping_history
+    WHERE checked_at >= $1 AND checked_at <= $2
+    GROUP BY ip_address, bts_name
+  `;
+  const incidentSQL = `
+    WITH d AS (
+      SELECT ip_address, status,
+        LAG(status) OVER (PARTITION BY ip_address ORDER BY checked_at) AS prev_status
+      FROM ping_history
+      WHERE checked_at >= $1 AND checked_at <= $2
+    )
+    SELECT ip_address, COUNT(*) AS down_incidents
+    FROM d WHERE status = 'Down' AND prev_status = 'Up'
+    GROUP BY ip_address
+  `;
+
+  const [statsRes, incidentRes] = await Promise.all([
+    query(statsSQL,    [startTs, endTs]),
+    query(incidentSQL, [startTs, endTs]),
+  ]);
+
+  if (statsRes.rowCount === 0) {
+    return { date: targetDate, routers_processed: 0, events_stored: 0, message: 'No ping_history data for this date.' };
+  }
+
+  const incidentMap = new Map();
+  for (const row of incidentRes.rows)
+    incidentMap.set(row.ip_address, parseInt(row.down_incidents));
+
+  const sumCols = [
+    'summary_date','bts_name','ip_address',
+    'up_seconds','down_seconds','down_incidents',
+    'uptime_pct','downtime_pct',
+  ];
+  const sumValuesSql = [];
+  const sumParams    = [];
+
+  statsRes.rows.forEach((row, i) => {
+    const up_seconds     = parseInt(row.up_seconds);
+    const down_seconds   = parseInt(row.down_seconds);
+    const monitored      = up_seconds + down_seconds;
+    const down_incidents = incidentMap.get(row.ip_address) || 0;
+    const uptime_pct     = monitored > 0 ? Math.round((up_seconds   / monitored) * 10000) / 100 : 0;
+    const downtime_pct   = monitored > 0 ? Math.round((down_seconds / monitored) * 10000) / 100 : 0;
+
+    const base = i * sumCols.length;
+    const placeholders = sumCols.map((_, j) => `$${base + j + 1}`);
+    sumValuesSql.push(`(${placeholders.join(',')})`);
+    sumParams.push(
+      targetDate, row.bts_name, row.ip_address,
+      up_seconds, down_seconds, down_incidents,
+      uptime_pct, downtime_pct,
+    );
+  });
+
+  const sumUpsertSQL = `
+    INSERT INTO daily_summary (${sumCols.join(',')})
+    VALUES ${sumValuesSql.join(',')}
+    ON CONFLICT (summary_date, ip_address) DO UPDATE SET
+      bts_name       = EXCLUDED.bts_name,
+      up_seconds     = EXCLUDED.up_seconds,
+      down_seconds   = EXCLUDED.down_seconds,
+      down_incidents = EXCLUDED.down_incidents,
+      uptime_pct     = EXCLUDED.uptime_pct,
+      downtime_pct   = EXCLUDED.downtime_pct
+  `;
+  await query(sumUpsertSQL, sumParams);
+
+  // ── PART B — daily_events (Up/Down transition cycles) ──
+  // Pull the day's raw rows plus 1 row of context before/after
+  // so cycles that span midnight still get correct started_at/
+  // ended_at. We detect cycle starts (prev status differs) and
+  // cycle ends (next status differs), pair them by row order,
+  // then keep only cycles that overlap this calendar date.
+  const eventsSQL = `
+    WITH window_rows AS (
+      SELECT bts_name, ip_address, up_time, down_time,
+        up_time_last_24h, down_time_last_24h,
+        status, countdown, checked_at
+      FROM ping_history
+      WHERE checked_at >= $1::timestamptz - INTERVAL '1 day'
+        AND checked_at <= $2::timestamptz + INTERVAL '1 day'
+    ),
+    ranked AS (
+      SELECT *,
+        LAG(status)  OVER (PARTITION BY ip_address ORDER BY checked_at) AS prev_status,
+        LEAD(status) OVER (PARTITION BY ip_address ORDER BY checked_at) AS next_status
+      FROM window_rows
+    ),
+    cycle_starts AS (
+      SELECT ip_address, checked_at AS started_at,
+        ROW_NUMBER() OVER (PARTITION BY ip_address ORDER BY checked_at ASC) AS rn
+      FROM ranked
+      WHERE prev_status IS NULL OR prev_status <> status
+    ),
+    cycle_ends AS (
+      SELECT bts_name, ip_address, up_time, down_time,
+        up_time_last_24h, down_time_last_24h,
+        status, countdown, checked_at AS ended_at, next_status,
+        ROW_NUMBER() OVER (PARTITION BY ip_address ORDER BY checked_at ASC) AS rn
+      FROM ranked
+      WHERE next_status IS NULL OR next_status <> status
+    )
+    SELECT
+      ce.bts_name, ce.ip_address,
+      ce.up_time, ce.down_time,
+      ce.up_time_last_24h, ce.down_time_last_24h,
+      ce.status, ce.countdown,
+      cs.started_at,
+      CASE WHEN ce.next_status IS NULL THEN NULL ELSE ce.ended_at END AS ended_at
+    FROM cycle_ends ce
+    JOIN cycle_starts cs ON cs.ip_address = ce.ip_address AND cs.rn = ce.rn
+    WHERE cs.started_at <= $2::timestamptz
+      AND (ce.ended_at IS NULL OR ce.ended_at >= $1::timestamptz)
+      AND (ce.next_status IS NOT NULL OR cs.started_at >= $1::timestamptz - INTERVAL '1 day')
+    ORDER BY ce.ip_address, cs.started_at ASC
+  `;
+  const eventsRes = await query(eventsSQL, [startTs, endTs]);
+
+  // Clear old events for this date first (safe re-run), then insert fresh
+  await query('DELETE FROM daily_events WHERE event_date = $1', [targetDate]);
+
+  let eventsStored = 0;
+  if (eventsRes.rowCount > 0) {
+    const evCols = [
+      'event_date','bts_name','ip_address',
+      'up_time','down_time','up_time_last_24h','down_time_last_24h',
+      'status','countdown','started_at','ended_at',
+    ];
+    const evValuesSql = [];
+    const evParams    = [];
+
+    eventsRes.rows.forEach((row, i) => {
+      const base = i * evCols.length;
+      const placeholders = evCols.map((_, j) => `$${base + j + 1}`);
+      evValuesSql.push(`(${placeholders.join(',')})`);
+      evParams.push(
+        targetDate, row.bts_name, row.ip_address,
+        row.up_time, row.down_time, row.up_time_last_24h, row.down_time_last_24h,
+        row.status, row.countdown, row.started_at, row.ended_at,
+      );
     });
-  } catch (err) { serverError(res, err); }
-});
+
+    const evInsertSQL = `INSERT INTO daily_events (${evCols.join(',')}) VALUES ${evValuesSql.join(',')}`;
+    await query(evInsertSQL, evParams);
+    eventsStored = eventsRes.rowCount;
+  }
+
+  return {
+    date: targetDate,
+    routers_processed: statsRes.rowCount,
+    events_stored: eventsStored,
+    message: `Daily summary + events computed for ${targetDate}`,
+  };
+}
 
 // ══════════════════════════════════════════════════════════
 //  5. POST /api/analytics/run-daily-summary?date=YYYY-MM-DD
+//  Still available for manual use, but no longer required —
+//  the scheduler (src/scheduler.js) runs this automatically
+//  every night and self-heals missed days on server startup.
 // ══════════════════════════════════════════════════════════
 router.post('/analytics/run-daily-summary', async (req, res) => {
   try {
@@ -461,101 +617,148 @@ router.post('/analytics/run-daily-summary', async (req, res) => {
       d.setUTCDate(d.getUTCDate() - 1);
       targetDate = d.toISOString().slice(0, 10);
     }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
-      return res.status(400).json({ success: false, error: 'date must be YYYY-MM-DD' });
-    }
+    const result = await runDailyJob(targetDate);
+    res.json({ success: true, ...result });
+  } catch (err) { serverError(res, err); }
+});
 
-    const startTs = `${targetDate}T00:00:00.000Z`;
-    const endTs   = `${targetDate}T23:59:59.999Z`;
-
-    const statsSQL = `
-      SELECT ip_address, bts_name,
-        COALESCE(SUM(CASE WHEN status = 'Up'   THEN 30 ELSE 0 END), 0) AS up_seconds,
-        COALESCE(SUM(CASE WHEN status = 'Down' THEN 30 ELSE 0 END), 0) AS down_seconds
-      FROM ping_history
-      WHERE checked_at >= $1 AND checked_at <= $2
-      GROUP BY ip_address, bts_name
-    `;
-    const incidentSQL = `
-      WITH d AS (
-        SELECT ip_address, status,
-          LAG(status) OVER (PARTITION BY ip_address ORDER BY checked_at) AS prev_status
-        FROM ping_history
-        WHERE checked_at >= $1 AND checked_at <= $2
-      )
-      SELECT ip_address, COUNT(*) AS down_incidents
-      FROM d WHERE status = 'Down' AND prev_status = 'Up'
-      GROUP BY ip_address
-    `;
-
-    const [statsRes, incidentRes] = await Promise.all([
-      query(statsSQL,    [startTs, endTs]),
-      query(incidentSQL, [startTs, endTs]),
-    ]);
-
-    if (statsRes.rowCount === 0) {
-      return res.json({
-        success: true, date: targetDate,
-        message: 'No data found for this date.',
-        routers_processed: 0,
-      });
-    }
-
-    const incidentMap = new Map();
-    for (const row of incidentRes.rows)
-      incidentMap.set(row.ip_address, parseInt(row.down_incidents));
-
-    const cols = [
-      'summary_date','bts_name','ip_address',
-      'up_seconds','down_seconds','down_incidents',
-      'uptime_pct','downtime_pct',
-    ];
-    const valuesSql = [];
-    const params    = [];
-
-    statsRes.rows.forEach((row, i) => {
-      const up_seconds      = parseInt(row.up_seconds);
-      const down_seconds    = parseInt(row.down_seconds);
-      const monitored       = up_seconds + down_seconds;
-      const down_incidents  = incidentMap.get(row.ip_address) || 0;
-      // Use monitored_seconds for daily_summary too
-      const uptime_pct      = monitored > 0 ? Math.round((up_seconds   / monitored) * 10000) / 100 : 0;
-      const downtime_pct    = monitored > 0 ? Math.round((down_seconds / monitored) * 10000) / 100 : 0;
-
-      const base = i * cols.length;
-      const placeholders = cols.map((_, j) => `$${base + j + 1}`);
-      valuesSql.push(`(${placeholders.join(',')})`);
-      params.push(
-        targetDate, row.bts_name, row.ip_address,
+// ══════════════════════════════════════════════════════════
+//  6. GET /api/analytics/date/:date
+//  ALL BTS summary for ONE specific calendar date.
+//  Example: GET /api/analytics/date/2026-03-25
+// ══════════════════════════════════════════════════════════
+router.get('/analytics/date/:date', async (req, res) => {
+  const targetDate = req.params.date;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+    return res.status(400).json({ success: false, error: 'date must be YYYY-MM-DD' });
+  }
+  try {
+    const sql = `
+      SELECT bts_name, ip_address,
         up_seconds, down_seconds, down_incidents,
-        uptime_pct, downtime_pct,
-      );
-    });
-
-    const upsertSQL = `
-      INSERT INTO daily_summary (${cols.join(',')})
-      VALUES ${valuesSql.join(',')}
-      ON CONFLICT (summary_date, ip_address) DO UPDATE SET
-        bts_name       = EXCLUDED.bts_name,
-        up_seconds     = EXCLUDED.up_seconds,
-        down_seconds   = EXCLUDED.down_seconds,
-        down_incidents = EXCLUDED.down_incidents,
-        uptime_pct     = EXCLUDED.uptime_pct,
-        downtime_pct   = EXCLUDED.downtime_pct
+        uptime_pct, downtime_pct
+      FROM daily_summary
+      WHERE summary_date = $1
+      ORDER BY bts_name
     `;
-    await query(upsertSQL, params);
+    const result = await query(sql, [targetDate]);
 
     res.json({
-      success: true, date: targetDate,
-      routers_processed: statsRes.rowCount,
-      message: `Daily summary computed for ${targetDate}`,
+      success: true,
+      date:    targetDate,
+      count:   result.rowCount,
+      data:    result.rows,
     });
   } catch (err) { serverError(res, err); }
 });
 
 // ══════════════════════════════════════════════════════════
-//  6. POST /api/ask
+//  7. GET /api/analytics/date/:date/:ip
+//  ONE BTS's events for ONE specific calendar date — this is
+//  what the "click a BTS" action calls. Same shape as
+//  /api/routers/:ip/last-events but scoped to a single date,
+//  read instantly from the pre-computed daily_events table.
+//  Example: GET /api/analytics/date/2026-03-25/10.200.205.162
 // ══════════════════════════════════════════════════════════
+router.get('/analytics/date/:date/:ip', async (req, res) => {
+  const targetDate = req.params.date;
+  const ip = req.params.ip;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+    return res.status(400).json({ success: false, error: 'date must be YYYY-MM-DD' });
+  }
+  try {
+    const check = await query('SELECT bts_name FROM routers WHERE ip_address = $1', [ip]);
+    if (check.rowCount === 0) return notFound(res, ip);
+
+    const summarySQL = `
+      SELECT up_seconds, down_seconds, down_incidents, uptime_pct, downtime_pct
+      FROM daily_summary
+      WHERE summary_date = $1 AND ip_address = $2
+    `;
+    const eventsSQL = `
+      SELECT bts_name, ip_address,
+        up_time, down_time, up_time_last_24h, down_time_last_24h,
+        status, countdown, started_at, ended_at
+      FROM daily_events
+      WHERE event_date = $1 AND ip_address = $2
+      ORDER BY started_at ASC
+    `;
+
+    const [summaryRes, eventsRes] = await Promise.all([
+      query(summarySQL, [targetDate, ip]),
+      query(eventsSQL,  [targetDate, ip]),
+    ]);
+
+    res.json({
+      success:    true,
+      bts_name:   check.rows[0].bts_name,
+      ip_address: ip,
+      date:       targetDate,
+      summary:    summaryRes.rowCount > 0 ? summaryRes.rows[0] : null,
+      events:     eventsRes.rows,
+    });
+  } catch (err) { serverError(res, err); }
+});
+
+// ══════════════════════════════════════════════════════════
+//  8. GET /api/analytics/range/:ip?start=YYYY-MM-DD&end=YYYY-MM-DD
+//  ONE BTS's daily summaries across a custom date range.
+//  Replaces the old /analytics/daily-breakdown endpoint.
+//  Example: /api/analytics/range/10.200.205.162?start=2026-02-12&end=2026-06-28
+// ══════════════════════════════════════════════════════════
+router.get('/analytics/range/:ip', async (req, res) => {
+  const ip = req.params.ip;
+  const { start, end } = req.query;
+
+  if (!start || !end ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(start) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Both start and end query params are required, format YYYY-MM-DD',
+    });
+  }
+
+  try {
+    const check = await query('SELECT bts_name FROM routers WHERE ip_address = $1', [ip]);
+    if (check.rowCount === 0) return notFound(res, ip);
+
+    const sql = `
+      SELECT summary_date,
+        up_seconds, down_seconds, down_incidents,
+        uptime_pct, downtime_pct
+      FROM daily_summary
+      WHERE ip_address = $1
+        AND summary_date BETWEEN $2 AND $3
+      ORDER BY summary_date ASC
+    `;
+    const result = await query(sql, [ip, start, end]);
+
+    // ── Totals across the whole range ──
+    const totalUp   = result.rows.reduce((sum, r) => sum + r.up_seconds, 0);
+    const totalDown = result.rows.reduce((sum, r) => sum + r.down_seconds, 0);
+    const totalMon  = totalUp + totalDown;
+    const totalIncidents = result.rows.reduce((sum, r) => sum + r.down_incidents, 0);
+
+    res.json({
+      success:    true,
+      bts_name:   check.rows[0].bts_name,
+      ip_address: ip,
+      start, end,
+      days_found: result.rowCount,
+      totals: {
+        up_seconds:     totalUp,
+        down_seconds:   totalDown,
+        monitored_seconds: totalMon,
+        uptime_pct:     totalMon > 0 ? Math.round((totalUp   / totalMon) * 10000) / 100 : 0,
+        downtime_pct:   totalMon > 0 ? Math.round((totalDown / totalMon) * 10000) / 100 : 0,
+        down_incidents: totalIncidents,
+      },
+      days: result.rows,
+    });
+  } catch (err) { serverError(res, err); }
+});
+
 function detectIntent(q) {
   const lower = q.toLowerCase();
   if (/(how many times|number of times|times.*(down|up)|went down|down (event|incident)s?)/.test(lower))
@@ -668,3 +871,4 @@ router.post('/ask', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.runDailyJob = runDailyJob;

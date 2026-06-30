@@ -9,6 +9,7 @@ const { testConnection } = require('./db');
 const routerRoutes = require('./routes/routers');
 const analyticsRoutes = require('./routes/analytics');
 const pingEngine   = require('./pingEngine');
+const scheduler    = require('./scheduler');
 
 const app  = express();
 const PORT = parseInt(process.env.PORT) || 3000;
@@ -77,6 +78,10 @@ async function boot() {
 
   // Start ping engine in same process
   await pingEngine.start();
+
+  // Start automatic nightly daily-summary scheduler
+  // (also self-heals any missed days right now on startup)
+  scheduler.start();
 }
 
 boot();
