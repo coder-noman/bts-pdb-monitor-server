@@ -677,12 +677,20 @@ router.get('/analytics/date/:date/:ip', async (req, res) => {
     `;
     const eventsSQL = `
       SELECT bts_name, ip_address,
-        up_time, down_time, up_time_last_24h, down_time_last_24h,
-        status, countdown, started_at, ended_at
+        up_time, down_time,
+        status, started_at, ended_at
       FROM daily_events
       WHERE event_date = $1 AND ip_address = $2
       ORDER BY started_at ASC
     `;
+    // const eventsSQL = `
+    //   SELECT bts_name, ip_address,
+    //     up_time, down_time, up_time_last_24h, down_time_last_24h,
+    //     status, countdown, started_at, ended_at
+    //   FROM daily_events
+    //   WHERE event_date = $1 AND ip_address = $2
+    //   ORDER BY started_at ASC
+    // `;
 
     const [summaryRes, eventsRes] = await Promise.all([
       query(summarySQL, [targetDate, ip]),

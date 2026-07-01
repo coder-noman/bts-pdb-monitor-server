@@ -12,9 +12,9 @@ GET     http://localhost:3000/api/routers/10.200.205.162/last-events
 GET     http://localhost:3000/api/routers/10.200.205.162/last-events?limit=50&page=1
 
 For Excel Report 
-GET http://localhost:3000/api/analytics/report/excel/1d
-GET http://localhost:3000/api/analytics/report/excel/7d
-GET http://localhost:3000/api/analytics/report/excel/30d
+GET     http://localhost:3000/api/analytics/report/excel/1d
+GET     http://localhost:3000/api/analytics/report/excel/7d
+GET     http://localhost:3000/api/analytics/report/excel/30d
 
 Analytics & Reporting
 GET     http://localhost:3000/api/analytics/all?period=1d
