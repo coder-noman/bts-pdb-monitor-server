@@ -1075,6 +1075,228 @@ router.get('/analytics/range/:ip', async (req, res) => {
     });
   } catch (err) { serverError(res, err); }
 });
+// ══════════════════════════════════════════════════════════
+//  MONTHLY SYSTEM — 3 APIs
+//
+//  10a. GET /api/analytics/monthly/:ip?month=2026-06
+//       Single BTS — one calendar month summary
+//
+//  10b. GET /api/analytics/monthly/all?month=2026-06
+//       ALL BTS — one calendar month summary
+//
+//  10c. GET /api/analytics/monthly-range/:ip?start=2026-01&end=2026-06
+//       Single BTS — month-by-month breakdown across a range
+//       (e.g. Jan to Jun = 6 rows, one per month)
+//
+//  All read from daily_summary (pre-computed, instant).
+//  Formula: uptime%   = (up_seconds   / monitored_seconds) * 100
+//           downtime% = (down_seconds / monitored_seconds) * 100
+//
+//  month format: YYYY-MM  (e.g. 2026-06)
+// ══════════════════════════════════════════════════════════
+
+// Helper — validate YYYY-MM format
+function isValidMonth(m) { return /^\d{4}-\d{2}$/.test(m); }
+
+// Helper — get first and last date of a YYYY-MM month string
+function monthBounds(month) {
+  const [year, mon] = month.split('-').map(Number);
+  const start = `${month}-01`;
+  const lastDay = new Date(year, mon, 0).getDate(); // day 0 of next month = last day of this
+  const end = `${month}-${String(lastDay).padStart(2, '0')}`;
+  return { start, end };
+}
+
+// Helper — compute monthly totals from daily_summary rows
+function aggregateRows(rows) {
+  const up_seconds     = rows.reduce((s, r) => s + (parseInt(r.up_seconds)   || 0), 0);
+  const down_seconds   = rows.reduce((s, r) => s + (parseInt(r.down_seconds) || 0), 0);
+  const down_incidents = rows.reduce((s, r) => s + (parseInt(r.down_incidents) || 0), 0);
+  const monitored_seconds = up_seconds + down_seconds;
+  const uptime_pct   = monitored_seconds > 0 ? Math.round((up_seconds   / monitored_seconds) * 10000) / 100 : 0;
+  const downtime_pct = monitored_seconds > 0 ? Math.round((down_seconds / monitored_seconds) * 10000) / 100 : 0;
+  return { up_seconds, down_seconds, monitored_seconds, down_incidents, uptime_pct, downtime_pct };
+}
+
+// ── 10a. Single BTS — one month ─────────────────────────
+router.get('/analytics/monthly/all', async (req, res) => {
+  const month = req.query.month;
+
+  if (!month || !isValidMonth(month)) {
+    return res.status(400).json({ success: false, error: 'month query param required, format YYYY-MM (e.g. 2026-06)' });
+  }
+  try {
+    const { start, end } = monthBounds(month);
+
+    // Get all routers
+    const routersRes = await query('SELECT bts_name, ip_address FROM routers ORDER BY bts_name');
+    if (routersRes.rowCount === 0) {
+      return res.json({ success: true, month, count: 0, data: [] });
+    }
+
+    // Get monthly totals for all routers in ONE query
+    const sql = `
+      SELECT ip_address,
+        COALESCE(SUM(up_seconds),   0) AS up_seconds,
+        COALESCE(SUM(down_seconds), 0) AS down_seconds,
+        COALESCE(SUM(down_incidents), 0) AS down_incidents
+      FROM daily_summary
+      WHERE summary_date BETWEEN $1 AND $2
+      GROUP BY ip_address
+    `;
+    const statsRes = await query(sql, [start, end]);
+    const statsMap = new Map(statsRes.rows.map(r => [r.ip_address, r]));
+
+    const data = routersRes.rows.map(r => {
+      const s = statsMap.get(r.ip_address) || { up_seconds: 0, down_seconds: 0, down_incidents: 0 };
+      const up_seconds      = parseInt(s.up_seconds)      || 0;
+      const down_seconds    = parseInt(s.down_seconds)    || 0;
+      const down_incidents  = parseInt(s.down_incidents)  || 0;
+      const monitored_seconds = up_seconds + down_seconds;
+      const uptime_pct   = monitored_seconds > 0 ? Math.round((up_seconds   / monitored_seconds) * 10000) / 100 : 0;
+      const downtime_pct = monitored_seconds > 0 ? Math.round((down_seconds / monitored_seconds) * 10000) / 100 : 0;
+
+      return {
+        bts_name:           r.bts_name,
+        ip_address:         r.ip_address,
+        up_seconds,
+        down_seconds,
+        monitored_seconds,
+        down_incidents,
+        uptime_pct,
+        downtime_pct,
+      };
+    });
+
+    res.json({
+      success: true,
+      month,
+      month_start: start,
+      month_end:   end,
+      count:       data.length,
+      data,
+    });
+  } catch (err) { serverError(res, err); }
+});
+
+// ── 10c. Single BTS — month-by-month range ───────────────
+// Example: ?start=2026-01&end=2026-06
+// Returns 6 rows, one per calendar month, plus overall totals
+router.get('/analytics/monthly/:ip', async (req, res) => {
+  const ip    = req.params.ip;
+  const month = req.query.month;  // e.g. 2026-06
+
+  if (!month || !isValidMonth(month)) {
+    return res.status(400).json({ success: false, error: 'month query param required, format YYYY-MM (e.g. 2026-06)' });
+  }
+  try {
+    const check = await query('SELECT bts_name FROM routers WHERE ip_address = $1', [ip]);
+    if (check.rowCount === 0) return notFound(res, ip);
+
+    const { start, end } = monthBounds(month);
+
+    const sql = `
+      SELECT summary_date, up_seconds, down_seconds, down_incidents, uptime_pct, downtime_pct
+      FROM daily_summary
+      WHERE ip_address = $1
+        AND summary_date BETWEEN $2 AND $3
+      ORDER BY summary_date ASC
+    `;
+    const result = await query(sql, [ip, start, end]);
+
+    const totals = aggregateRows(result.rows);
+
+    res.json({
+      success:     true,
+      bts_name:    check.rows[0].bts_name,
+      ip_address:  ip,
+      month,
+      days_found:  result.rowCount,
+      ...totals,
+      days: result.rows,
+    });
+  } catch (err) { serverError(res, err); }
+});
+
+// ── 10b. ALL BTS — one month ─────────────────────────────
+router.get('/analytics/monthly-range/:ip', async (req, res) => {
+  const ip    = req.params.ip;
+  const start = req.query.start;  // YYYY-MM
+  const end   = req.query.end;    // YYYY-MM
+
+  if (!start || !end || !isValidMonth(start) || !isValidMonth(end)) {
+    return res.status(400).json({
+      success: false,
+      error: 'start and end query params required, format YYYY-MM (e.g. start=2026-01&end=2026-06)',
+    });
+  }
+  if (start > end) {
+    return res.status(400).json({ success: false, error: 'start must be before or equal to end' });
+  }
+
+  try {
+    const check = await query('SELECT bts_name FROM routers WHERE ip_address = $1', [ip]);
+    if (check.rowCount === 0) return notFound(res, ip);
+
+    // Build list of months between start and end inclusive
+    const months = [];
+    let [sy, sm] = start.split('-').map(Number);
+    const [ey, em] = end.split('-').map(Number);
+    while (sy < ey || (sy === ey && sm <= em)) {
+      months.push(`${sy}-${String(sm).padStart(2, '0')}`);
+      sm++;
+      if (sm > 12) { sm = 1; sy++; }
+    }
+
+    // Fetch all daily_summary rows in one query covering the full range
+    const { start: rangeStart } = monthBounds(start);
+    const { end:   rangeEnd   } = monthBounds(end);
+
+    const sql = `
+      SELECT summary_date, up_seconds, down_seconds, down_incidents
+      FROM daily_summary
+      WHERE ip_address = $1
+        AND summary_date BETWEEN $2 AND $3
+      ORDER BY summary_date ASC
+    `;
+    const result = await query(sql, [ip, rangeStart, rangeEnd]);
+
+    // Group rows by YYYY-MM
+    const byMonth = new Map();
+    for (const row of result.rows) {
+      const m = row.summary_date.toISOString
+        ? row.summary_date.toISOString().slice(0, 7)
+        : String(row.summary_date).slice(0, 7);
+      if (!byMonth.has(m)) byMonth.set(m, []);
+      byMonth.get(m).push(row);
+    }
+
+    // Build one row per month
+    const monthlyData = months.map(m => {
+      const rows   = byMonth.get(m) || [];
+      const totals = aggregateRows(rows);
+      return {
+        month:      m,
+        days_found: rows.length,
+        ...totals,
+      };
+    });
+
+    // Overall totals across the full range
+    const overallTotals = aggregateRows(result.rows);
+
+    res.json({
+      success:    true,
+      bts_name:   check.rows[0].bts_name,
+      ip_address: ip,
+      start, end,
+      months_count:   months.length,
+      overall_totals: overallTotals,
+      months: monthlyData,
+    });
+  } catch (err) { serverError(res, err); }
+});
+
 
 // ══════════════════════════════════════════════════════════
 //  9a. GET /api/analytics/date/:date/excel
