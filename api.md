@@ -37,6 +37,10 @@ http://localhost:3000/api/analytics/date/2026-06-16
 http://localhost:3000/api/analytics/date/2026-06-16/10.200.205.2
 http://localhost:3000/api/analytics/range/10.200.205.2?start=2026-06-15&end=2026-06-16
 
+Date Wise Analytics Excel report
+http://localhost:3000/api/analytics/date/2026-06-28/excel
+http://localhost:3000/api/analytics/date/2026-06-28/10.200.106.210/excel
+
 Natural Language Query
 POST    http://localhost:3000/api/ask
 Body (JSON): { "question": "how many BTS are down right now?" }
