@@ -8,6 +8,19 @@ const ExcelJS  = require('exceljs');
 const { query } = require('../db');
 const { formatDuration } = require('../utils');
 
+// Convert a timestamp -> 12-hour time only, e.g. "9:00 AM", "2:00 PM"
+function formatTimeOnly(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  let hours = d.getUTCHours();
+  const minutes = d.getUTCMinutes();
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12;
+  if (hours === 0) hours = 12;
+  const minStr = minutes.toString().padStart(2, '0');
+  return `${hours}:${minStr} ${ampm}`;
+}
+
 function serverError(res, err) {
   console.error('[ANALYTICS]', err.message);
   return res.status(500).json({ success: false, error: err.message });
@@ -664,7 +677,7 @@ router.get('/analytics/date/:date/excel', async (req, res) => {
         down_incidents, uptime_pct, downtime_pct
       FROM daily_summary
       WHERE summary_date = $1
-      ORDER BY bts_name
+      ORDER BY downtime_pct DESC
     `;
     const result = await query(sql, [targetDate]);
     if (result.rowCount === 0) {
@@ -926,7 +939,7 @@ router.get('/analytics/date/:date/:ip/excel', async (req, res) => {
     ws.getRow(13).height = 20;
 
     // Row 14 — Events column headers
-    const evHeaders = ['#', 'Status', 'Started At', 'Ended At', 'Up Time', 'Down Time', 'Up 24h', 'Down 24h', 'Countdown'];
+    const evHeaders = ['#', 'Status', 'Start', 'End', 'Up Time', 'Down Time'];
     const evHeaderRow = ws.getRow(14);
     evHeaders.forEach((h, i) => {
       const cell = evHeaderRow.getCell(i + 1);
@@ -938,7 +951,7 @@ router.get('/analytics/date/:date/:ip/excel', async (req, res) => {
 
     // Rows 15+ — Event data rows
     if (eventsRes.rowCount === 0) {
-      ws.mergeCells('A15:I15');
+      ws.mergeCells('A15:F15');
       Object.assign(ws.getCell('A15'), {
         value: 'No events recorded for this date.',
         font: { name: 'Arial', size: 10, italic: true, color: { argb: 'FF757575' } },
@@ -952,13 +965,10 @@ router.get('/analytics/date/:date/:ip/excel', async (req, res) => {
         const evVals  = [
           idx + 1,
           ev.status,
-          ev.started_at ? new Date(ev.started_at).toISOString().replace('T', ' ').slice(0, 19) : '',
-          ev.ended_at   ? new Date(ev.ended_at).toISOString().replace('T', ' ').slice(0, 19)   : 'Ongoing',
-          formatDurationHM(parseInt(ev.up_time)              || 0),
-          formatDurationHM(parseInt(ev.down_time)            || 0),
-          formatDurationHM(parseInt(ev.up_time_last_24h)     || 0),
-          formatDurationHM(parseInt(ev.down_time_last_24h)   || 0),
-          ev.countdown,
+          formatTimeOnly(ev.started_at),
+          ev.ended_at ? formatTimeOnly(ev.ended_at) : 'Ongoing',
+          formatDurationHM(parseInt(ev.up_time)   || 0),
+          formatDurationHM(parseInt(ev.down_time) || 0),
         ];
         evVals.forEach((val, i) => {
           const cell = dataRow.getCell(i + 1);
