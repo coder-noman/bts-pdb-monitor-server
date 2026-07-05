@@ -240,16 +240,16 @@ router.get('/analytics/all', async (req, res) => {
 // ══════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════
-//  formatDurationHM — "2h 30min" style for Excel cells
+//  formatDurationHM — "2h 30m" style for Excel cells
 // ══════════════════════════════════════════════════════════
 function formatDurationHM(seconds) {
   seconds = Math.max(0, Math.round(seconds));
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
   const m = Math.floor((seconds % 3600) / 60);
-  if (d > 0) return `${d}d ${h}h ${m}min`;
-  if (h > 0) return `${h}h ${m}min`;
-  if (m > 0) return `${m}min`;
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
   return `${seconds}s`;
 }
 
@@ -1028,6 +1028,275 @@ router.get('/analytics/date/:date/:ip', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════
+//  8b. GET /api/analytics/range/all?start=YYYY-MM-DD&end=YYYY-MM-DD
+//  ALL BTS — totals summed across the whole date range.
+//  Same shape as /analytics/range/:ip's "totals" block, but
+//  returns one such block per router, for every router at once.
+//  Example: /api/analytics/range/all?start=2026-06-28&end=2026-07-01
+// ══════════════════════════════════════════════════════════
+router.get('/analytics/range/all', async (req, res) => {
+  const { start, end } = req.query;
+
+  if (!start || !end ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(start) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Both start and end query params are required, format YYYY-MM-DD',
+    });
+  }
+  if (start > end) {
+    return res.status(400).json({ success: false, error: 'start must be before or equal to end' });
+  }
+
+  try {
+    // Get all routers so every router appears even with 0 days of data
+    const routersRes = await query('SELECT bts_name, ip_address FROM routers ORDER BY bts_name');
+    if (routersRes.rowCount === 0) {
+      return res.json({ success: true, start, end, count: 0, data: [] });
+    }
+
+    // Sum up_seconds/down_seconds/down_incidents per router across the
+    // whole range in ONE grouped query (same efficient pattern used
+    // everywhere else in this file for all-router endpoints).
+    const sql = `
+      SELECT ip_address,
+        COALESCE(SUM(up_seconds),     0) AS up_seconds,
+        COALESCE(SUM(down_seconds),   0) AS down_seconds,
+        COALESCE(SUM(down_incidents), 0) AS down_incidents,
+        COUNT(*) AS days_found
+      FROM daily_summary
+      WHERE summary_date BETWEEN $1 AND $2
+      GROUP BY ip_address
+    `;
+    const statsRes = await query(sql, [start, end]);
+    const statsMap = new Map(statsRes.rows.map(r => [r.ip_address, r]));
+
+    // ── Top-level days_found — count of distinct dates that have
+    // ── ANY daily_summary data in this range (not per-router) ──
+    const daysSql = `
+      SELECT COUNT(DISTINCT summary_date) AS days_found
+      FROM daily_summary
+      WHERE summary_date BETWEEN $1 AND $2
+    `;
+    const daysRes = await query(daysSql, [start, end]);
+    const days_found = parseInt(daysRes.rows[0].days_found) || 0;
+
+    const data = routersRes.rows.map(r => {
+      const s = statsMap.get(r.ip_address) || { up_seconds: 0, down_seconds: 0, down_incidents: 0 };
+      const up_seconds        = parseInt(s.up_seconds)     || 0;
+      const down_seconds      = parseInt(s.down_seconds)   || 0;
+      const down_incidents    = parseInt(s.down_incidents) || 0;
+      const monitored_seconds = up_seconds + down_seconds;
+      const uptime_pct   = monitored_seconds > 0 ? Math.round((up_seconds   / monitored_seconds) * 10000) / 100 : 0;
+      const downtime_pct = monitored_seconds > 0 ? Math.round((down_seconds / monitored_seconds) * 10000) / 100 : 0;
+
+      return {
+        bts_name:           r.bts_name,
+        ip_address:         r.ip_address,
+        start,
+        end,
+        up_seconds,
+        down_seconds,
+        monitored_seconds,
+        uptime_pct,
+        downtime_pct,
+        down_incidents,
+      };
+    });
+
+    res.json({
+      success: true,
+      start, end,
+      days_found,
+      count:   data.length,
+      data,
+    });
+  } catch (err) { serverError(res, err); }
+});
+
+// ══════════════════════════════════════════════════════════
+//  8c. GET /api/analytics/range/all/excel?start=YYYY-MM-DD&end=YYYY-MM-DD
+//  Excel report — ALL BTS, totals summed across a date range.
+//  Same design as /analytics/date/:date/excel, but header shows
+//  Start Date / End Date / Days Found instead of a single date.
+// ══════════════════════════════════════════════════════════
+router.get('/analytics/range/all/excel', async (req, res) => {
+  const { start, end } = req.query;
+
+  if (!start || !end ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(start) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Both start and end query params are required, format YYYY-MM-DD',
+    });
+  }
+  if (start > end) {
+    return res.status(400).json({ success: false, error: 'start must be before or equal to end' });
+  }
+
+  try {
+    const routersRes = await query('SELECT bts_name, ip_address FROM routers ORDER BY bts_name');
+    if (routersRes.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'No routers found' });
+    }
+
+    const sql = `
+      SELECT ip_address,
+        COALESCE(SUM(up_seconds),     0) AS up_seconds,
+        COALESCE(SUM(down_seconds),   0) AS down_seconds,
+        COALESCE(SUM(down_incidents), 0) AS down_incidents,
+        COUNT(*) AS days_found
+      FROM daily_summary
+      WHERE summary_date BETWEEN $1 AND $2
+      GROUP BY ip_address
+    `;
+    const statsRes = await query(sql, [start, end]);
+    const statsMap = new Map(statsRes.rows.map(r => [r.ip_address, r]));
+
+    // Build final rows with % calculated, then sort by downtime% DESC
+    const rows = routersRes.rows.map(r => {
+      const s = statsMap.get(r.ip_address) || { up_seconds: 0, down_seconds: 0, down_incidents: 0, days_found: 0 };
+      const up_seconds        = parseInt(s.up_seconds)     || 0;
+      const down_seconds      = parseInt(s.down_seconds)   || 0;
+      const down_incidents    = parseInt(s.down_incidents) || 0;
+      const days_found        = parseInt(s.days_found)     || 0;
+      const monitored_seconds = up_seconds + down_seconds;
+      const uptime_pct   = monitored_seconds > 0 ? Math.round((up_seconds   / monitored_seconds) * 10000) / 100 : 0;
+      const downtime_pct = monitored_seconds > 0 ? Math.round((down_seconds / monitored_seconds) * 10000) / 100 : 0;
+      return {
+        bts_name: r.bts_name, ip_address: r.ip_address,
+        up_seconds, down_seconds, monitored_seconds,
+        down_incidents, uptime_pct, downtime_pct, days_found,
+      };
+    }).sort((a, b) => b.downtime_pct - a.downtime_pct);
+
+    const workbook   = new ExcelJS.Workbook();
+    workbook.creator = 'Link3 Technologies LTD';
+    workbook.created = new Date();
+
+    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const startFmt   = new Date(start).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const endFmt     = new Date(end).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+
+    const COMPANY_FONT = { name: 'Arial', size: 14, bold: true, color: { argb: 'FFFFFFFF' } };
+    const DEPT_FONT    = { name: 'Arial', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
+    const DATE_FONT    = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF333333' } };
+    const HEADER_FONT  = { name: 'Arial', size: 10, bold: true, color: { argb: 'FFFFFFFF' } };
+    const CELL_FONT    = { name: 'Arial', size: 10 };
+    const BLUE_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1565C0' } };
+    const TEAL_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF00695C' } };
+    const COL_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0D47A1' } };
+    const ODD_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF5F5F5' } };
+    const EVEN_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFFF' } };
+    const UP_FILL      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F5E9' } };
+    const DOWN_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFCE4EC' } };
+    const CENTER = { horizontal: 'center', vertical: 'middle' };
+    const LEFT   = { horizontal: 'left',   vertical: 'middle' };
+    const BORDER = {
+      top:    { style: 'thin', color: { argb: 'FFBDBDBD' } },
+      left:   { style: 'thin', color: { argb: 'FFBDBDBD' } },
+      bottom: { style: 'thin', color: { argb: 'FFBDBDBD' } },
+      right:  { style: 'thin', color: { argb: 'FFBDBDBD' } },
+    };
+
+    const COL_DEFS = [
+      { header: '#',              key: 'sl',             width: 5  },
+      { header: 'BTS Name',       key: 'bts_name',       width: 42 },
+      { header: 'IP Address',     key: 'ip_address',     width: 18 },
+      { header: 'Days Found',     key: 'days_found',     width: 12 },
+      { header: 'Up Time',        key: 'up_time_fmt',    width: 16 },
+      { header: 'Down Time',      key: 'down_time_fmt',  width: 16 },
+      { header: 'Monitored Time', key: 'monitored_fmt',  width: 18 },
+      { header: 'Uptime %',       key: 'uptime_pct',     width: 12 },
+      { header: 'Downtime %',     key: 'downtime_pct',   width: 13 },
+      { header: 'Down Incidents', key: 'down_incidents', width: 17 },
+    ];
+
+    const ws = workbook.addWorksheet('Range Report', {
+      pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true },
+    });
+    ws.columns = COL_DEFS.map(c => ({ key: c.key, width: c.width }));
+
+    ws.mergeCells('A1:J1');
+    Object.assign(ws.getCell('A1'), { value: 'Link3 Technologies LTD', font: COMPANY_FONT, fill: BLUE_FILL, alignment: CENTER });
+    ws.getRow(1).height = 28;
+
+    ws.mergeCells('A2:J2');
+    Object.assign(ws.getCell('A2'), { value: 'BTS and Power Department', font: DEPT_FONT, fill: TEAL_FILL, alignment: CENTER });
+    ws.getRow(2).height = 22;
+
+    ws.mergeCells('A3:J3');
+    Object.assign(ws.getCell('A3'), {
+      value: `Range Analytics Report  |  Start Date: ${startFmt}  |  End Date: ${endFmt}  |  Generated: ${reportDate}`,
+      font: DATE_FONT, alignment: CENTER,
+      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE3F2FD' } },
+    });
+    ws.getRow(3).height = 18;
+    ws.getRow(4).height = 6;
+
+    const headerRow = ws.getRow(5);
+    COL_DEFS.forEach((col, i) => {
+      const cell = headerRow.getCell(i + 1);
+      cell.value = col.header;
+      cell.font = HEADER_FONT; cell.fill = COL_FILL;
+      cell.alignment = CENTER; cell.border = BORDER;
+    });
+    headerRow.height = 20;
+
+    rows.forEach((row, idx) => {
+      const isOdd   = idx % 2 === 0;
+      const dataRow = ws.getRow(6 + idx);
+      const values  = {
+        sl:             idx + 1,
+        bts_name:       row.bts_name,
+        ip_address:     row.ip_address,
+        days_found:     row.days_found,
+        up_time_fmt:    formatDurationHM(row.up_seconds),
+        down_time_fmt:  formatDurationHM(row.down_seconds),
+        monitored_fmt:  formatDurationHM(row.monitored_seconds),
+        uptime_pct:     row.uptime_pct,
+        downtime_pct:   row.downtime_pct,
+        down_incidents: row.down_incidents,
+      };
+      COL_DEFS.forEach((col, i) => {
+        const cell = dataRow.getCell(i + 1);
+        cell.value = values[col.key];
+        cell.font = { ...CELL_FONT };
+        cell.border = BORDER;
+        cell.alignment = (col.key === 'bts_name') ? LEFT : CENTER;
+        if (col.key === 'uptime_pct') {
+          cell.fill = UP_FILL;
+          cell.font = { ...CELL_FONT, color: { argb: 'FF1B5E20' }, bold: true };
+        } else if (col.key === 'downtime_pct') {
+          cell.fill = DOWN_FILL;
+          cell.font = { ...CELL_FONT, color: { argb: 'FFB71C1C' }, bold: true };
+        } else {
+          cell.fill = isOdd ? ODD_FILL : EVEN_FILL;
+        }
+      });
+      dataRow.height = 18;
+    });
+
+    const sumRowNum = 6 + rows.length;
+    ws.mergeCells(`A${sumRowNum}:J${sumRowNum}`);
+    Object.assign(ws.getCell(`A${sumRowNum}`), {
+      value: `Total BTS: ${rows.length}  |  ${startFmt} to ${endFmt}`,
+      font: { name: 'Arial', size: 10, bold: true, color: { argb: 'FFFFFFFF' } },
+      fill: TEAL_FILL, alignment: LEFT,
+    });
+    ws.getRow(sumRowNum).height = 18;
+
+    const filename = `BTS_Range_Report_${start}_to_${end}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    await workbook.xlsx.write(res);
+    res.end();
+
+  } catch (err) { serverError(res, err); }
+});
+// ══════════════════════════════════════════════════════════
 //  8. GET /api/analytics/range/:ip?start=YYYY-MM-DD&end=YYYY-MM-DD
 //  ONE BTS's daily summaries across a custom date range.
 //  Replaces the old /analytics/daily-breakdown endpoint.
@@ -1051,7 +1320,7 @@ router.get('/analytics/range/:ip', async (req, res) => {
     if (check.rowCount === 0) return notFound(res, ip);
 
     const sql = `
-      SELECT summary_date,
+      SELECT summary_date::text AS summary_date,
         up_seconds, down_seconds, down_incidents,
         uptime_pct, downtime_pct
       FROM daily_summary
@@ -1085,6 +1354,207 @@ router.get('/analytics/range/:ip', async (req, res) => {
     });
   } catch (err) { serverError(res, err); }
 });
+
+// ══════════════════════════════════════════════════════════
+//  8d. GET /api/analytics/range/:ip/excel?start=YYYY-MM-DD&end=YYYY-MM-DD
+//  Excel report — ONE BTS, totals across a date range.
+//  Same design as /analytics/date/:date/:ip/excel: summary
+//  block first, then a day-by-day breakdown table below
+//  (the range equivalent of the single-date "events" list).
+// ══════════════════════════════════════════════════════════
+router.get('/analytics/range/:ip/excel', async (req, res) => {
+  const ip = req.params.ip;
+  const { start, end } = req.query;
+
+  if (!start || !end ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(start) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Both start and end query params are required, format YYYY-MM-DD',
+    });
+  }
+  if (start > end) {
+    return res.status(400).json({ success: false, error: 'start must be before or equal to end' });
+  }
+
+  try {
+    const check = await query('SELECT bts_name FROM routers WHERE ip_address = $1', [ip]);
+    if (check.rowCount === 0) return notFound(res, ip);
+    const bts_name = check.rows[0].bts_name;
+
+    const sql = `
+      SELECT summary_date::text AS summary_date,
+        up_seconds, down_seconds, down_incidents,
+        uptime_pct, downtime_pct
+      FROM daily_summary
+      WHERE ip_address = $1
+        AND summary_date BETWEEN $2 AND $3
+      ORDER BY summary_date ASC
+    `;
+    const result = await query(sql, [ip, start, end]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: `No data for ${ip} between ${start} and ${end}. Run daily summary first.` });
+    }
+
+    const totalUp   = result.rows.reduce((sum, r) => sum + r.up_seconds, 0);
+    const totalDown = result.rows.reduce((sum, r) => sum + r.down_seconds, 0);
+    const totalMon  = totalUp + totalDown;
+    const totalIncidents = result.rows.reduce((sum, r) => sum + r.down_incidents, 0);
+    const uptime_pct   = totalMon > 0 ? Math.round((totalUp   / totalMon) * 10000) / 100 : 0;
+    const downtime_pct = totalMon > 0 ? Math.round((totalDown / totalMon) * 10000) / 100 : 0;
+
+    const workbook   = new ExcelJS.Workbook();
+    workbook.creator = 'Link3 Technologies LTD';
+    workbook.created = new Date();
+
+    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const startFmt   = new Date(start).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const endFmt     = new Date(end).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+
+    const COMPANY_FONT  = { name: 'Arial', size: 14, bold: true, color: { argb: 'FFFFFFFF' } };
+    const DEPT_FONT     = { name: 'Arial', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
+    const DATE_FONT     = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF333333' } };
+    const HEADER_FONT   = { name: 'Arial', size: 10, bold: true, color: { argb: 'FFFFFFFF' } };
+    const LABEL_FONT    = { name: 'Arial', size: 10, bold: true, color: { argb: 'FF333333' } };
+    const VALUE_FONT    = { name: 'Arial', size: 10 };
+    const CELL_FONT     = { name: 'Arial', size: 10 };
+    const BLUE_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1565C0' } };
+    const TEAL_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF00695C' } };
+    const COL_FILL      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0D47A1' } };
+    const SUMMARY_FILL  = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8EAF6' } };
+    const ODD_FILL      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF5F5F5' } };
+    const EVEN_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFFF' } };
+    const UP_FILL       = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F5E9' } };
+    const DOWN_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFCE4EC' } };
+    const CENTER = { horizontal: 'center', vertical: 'middle' };
+    const LEFT   = { horizontal: 'left',   vertical: 'middle' };
+    const BORDER = {
+      top:    { style: 'thin', color: { argb: 'FFBDBDBD' } },
+      left:   { style: 'thin', color: { argb: 'FFBDBDBD' } },
+      bottom: { style: 'thin', color: { argb: 'FFBDBDBD' } },
+      right:  { style: 'thin', color: { argb: 'FFBDBDBD' } },
+    };
+
+    const ws = workbook.addWorksheet('BTS Range Report', {
+      pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true },
+    });
+    ws.columns = [
+      { width: 5  }, { width: 22 }, { width: 22 },
+      { width: 16 }, { width: 16 }, { width: 16 },
+      { width: 12 }, { width: 13 },
+    ];
+
+    // ── Header rows ──
+    ws.mergeCells('A1:H1');
+    Object.assign(ws.getCell('A1'), { value: 'Link3 Technologies LTD', font: COMPANY_FONT, fill: BLUE_FILL, alignment: CENTER });
+    ws.getRow(1).height = 28;
+
+    ws.mergeCells('A2:H2');
+    Object.assign(ws.getCell('A2'), { value: 'BTS and Power Department', font: DEPT_FONT, fill: TEAL_FILL, alignment: CENTER });
+    ws.getRow(2).height = 22;
+
+    ws.mergeCells('A3:H3');
+    Object.assign(ws.getCell('A3'), {
+      value: `BTS Range Report  |  IP: ${ip}  |  Start Date: ${startFmt}  |  End Date: ${endFmt}  |  Generated: ${reportDate}`,
+      font: DATE_FONT, alignment: CENTER,
+      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE3F2FD' } },
+    });
+    ws.getRow(3).height = 18;
+    ws.getRow(4).height = 6;
+
+    // ── Summary block (rows 5–12) ──
+    ws.mergeCells('A5:H5');
+    Object.assign(ws.getCell('A5'), {
+      value: `BTS: ${bts_name}`,
+      font: { name: 'Arial', size: 11, bold: true, color: { argb: 'FFFFFFFF' } },
+      fill: TEAL_FILL, alignment: LEFT,
+    });
+    ws.getRow(5).height = 20;
+
+    const summaryFields = [
+      ['Days Found',     result.rowCount],
+      ['Up Time',        formatDurationHM(totalUp)],
+      ['Down Time',      formatDurationHM(totalDown)],
+      ['Monitored Time', formatDurationHM(totalMon)],
+      ['Uptime %',       `${uptime_pct}%`],
+      ['Downtime %',     `${downtime_pct}%`],
+      ['Down Incidents', totalIncidents],
+    ];
+    summaryFields.forEach(([label, value], i) => {
+      const rowNum = 6 + i;
+      ws.mergeCells(`A${rowNum}:D${rowNum}`);
+      ws.mergeCells(`E${rowNum}:H${rowNum}`);
+      Object.assign(ws.getCell(`A${rowNum}`), { value: label, font: LABEL_FONT, fill: SUMMARY_FILL, alignment: LEFT, border: BORDER });
+      Object.assign(ws.getCell(`E${rowNum}`), { value, font: VALUE_FONT, fill: EVEN_FILL, alignment: LEFT, border: BORDER });
+      ws.getRow(rowNum).height = 18;
+    });
+
+    // Row 13 — spacer
+    ws.mergeCells('A13:H13');
+    ws.getRow(13).height = 10;
+
+    // Row 14 — Day-by-day breakdown section header
+    ws.mergeCells('A14:H14');
+    Object.assign(ws.getCell('A14'), {
+      value: `Day-by-Day Breakdown  —  ${startFmt} to ${endFmt}`,
+      font: { name: 'Arial', size: 11, bold: true, color: { argb: 'FFFFFFFF' } },
+      fill: TEAL_FILL, alignment: LEFT,
+    });
+    ws.getRow(14).height = 20;
+
+    // Row 15 — Column headers
+    const dayHeaders = ['#', 'Date', 'Up Time', 'Down Time', 'Uptime %', 'Downtime %', 'Down Incidents'];
+    const dayHeaderRow = ws.getRow(15);
+    dayHeaders.forEach((h, i) => {
+      const cell = dayHeaderRow.getCell(i + 1);
+      cell.value = h;
+      cell.font = HEADER_FONT; cell.fill = COL_FILL;
+      cell.alignment = CENTER; cell.border = BORDER;
+    });
+    dayHeaderRow.height = 20;
+
+    // Rows 16+ — one row per day
+    result.rows.forEach((day, idx) => {
+      const isOdd   = idx % 2 === 0;
+      const dataRow = ws.getRow(16 + idx);
+      const dayVals = [
+        idx + 1,
+        day.summary_date,
+        formatDurationHM(parseInt(day.up_seconds)   || 0),
+        formatDurationHM(parseInt(day.down_seconds) || 0),
+        day.uptime_pct,
+        day.downtime_pct,
+        day.down_incidents,
+      ];
+      dayVals.forEach((val, i) => {
+        const cell = dataRow.getCell(i + 1);
+        cell.value = val;
+        cell.font = { ...CELL_FONT };
+        cell.border = BORDER;
+        cell.alignment = (i === 1) ? LEFT : CENTER;
+        if (i === 4) {
+          cell.fill = UP_FILL;
+          cell.font = { ...CELL_FONT, color: { argb: 'FF1B5E20' }, bold: true };
+        } else if (i === 5) {
+          cell.fill = DOWN_FILL;
+          cell.font = { ...CELL_FONT, color: { argb: 'FFB71C1C' }, bold: true };
+        } else {
+          cell.fill = isOdd ? ODD_FILL : EVEN_FILL;
+        }
+      });
+      dataRow.height = 18;
+    });
+
+    const filename = `BTS_Range_Report_${ip}_${start}_to_${end}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    await workbook.xlsx.write(res);
+    res.end();
+
+  } catch (err) { serverError(res, err); }
+});
+
 // ══════════════════════════════════════════════════════════
 //  MONTHLY SYSTEM — 3 APIs
 //
@@ -1206,7 +1676,7 @@ router.get('/analytics/monthly/:ip', async (req, res) => {
     const { start, end } = monthBounds(month);
 
     const sql = `
-      SELECT summary_date, up_seconds, down_seconds, down_incidents, uptime_pct, downtime_pct
+      SELECT summary_date::text AS summary_date, up_seconds, down_seconds, down_incidents, uptime_pct, downtime_pct
       FROM daily_summary
       WHERE ip_address = $1
         AND summary_date BETWEEN $2 AND $3
@@ -1263,7 +1733,7 @@ router.get('/analytics/monthly-range/:ip', async (req, res) => {
     const { end:   rangeEnd   } = monthBounds(end);
 
     const sql = `
-      SELECT summary_date, up_seconds, down_seconds, down_incidents
+      SELECT summary_date::text AS summary_date, up_seconds, down_seconds, down_incidents
       FROM daily_summary
       WHERE ip_address = $1
         AND summary_date BETWEEN $2 AND $3
@@ -1271,12 +1741,11 @@ router.get('/analytics/monthly-range/:ip', async (req, res) => {
     `;
     const result = await query(sql, [ip, rangeStart, rangeEnd]);
 
-    // Group rows by YYYY-MM
+    // Group rows by YYYY-MM (summary_date is now a plain 'YYYY-MM-DD' string,
+    // no Date object conversion, so no timezone shifting can occur)
     const byMonth = new Map();
     for (const row of result.rows) {
-      const m = row.summary_date.toISOString
-        ? row.summary_date.toISOString().slice(0, 7)
-        : String(row.summary_date).slice(0, 7);
+      const m = row.summary_date.slice(0, 7);
       if (!byMonth.has(m)) byMonth.set(m, []);
       byMonth.get(m).push(row);
     }
