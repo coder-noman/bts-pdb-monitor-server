@@ -1,6 +1,8 @@
-// src/pingEngine.js — Production ICMP ping engine v2
-// Windows ICMP ping | 40 routers per batch | countdown-based down detection
-// | batched DB writes (1 query for status, 1 for history per cycle)
+// src/pingEngine.js — Production ICMP ping engine v3
+// Windows ICMP ping | 40 routers per batch
+// | countdown-based down detection WITH retroactive correction
+// | batched DB writes (2 queries per cycle, +1 tiny correction
+//   query only on the rare cycle a router gets confirmed Down)
 
 require('dotenv').config();
 const ping = require('ping');
@@ -45,17 +47,27 @@ async function pingBatch(routers) {
 //
 //  alive=false:
 //    countdown += 1 (capped at COUNTDOWN_THRESHOLD)
-//    if countdown < THRESHOLD  → still shows 'Up' (grace period)
-//                                 up_time += 30, down_time = 0
-//    if countdown == THRESHOLD → status = 'Down' (confirmed)
-//                                 down_time += 30, up_time = 0
-//                                 countdown stays frozen at THRESHOLD
+//    countdown 1..(THRESHOLD-1) → still reported 'Up' (grace period),
+//                                  up_time keeps growing normally
+//    countdown == THRESHOLD     → CONFIRMED DOWN this cycle.
+//                                  The entire grace window (the previous
+//                                  THRESHOLD-1 cycles that were stored as
+//                                  'Up') is now retroactively wrong — the
+//                                  router was actually down that whole time.
+//                                  down_time jumps straight to
+//                                  THRESHOLD*30 (the full confirmed window),
+//                                  and justConfirmed=true is returned so
+//                                  runPingCycle() can fix those already-
+//                                  written history rows.
+//    countdown stays == THRESHOLD on later cycles (still down) →
+//                                  down_time keeps growing normally (+30)
 //
 function updateState(ip, alive) {
   if (!routerState[ip]) {
     routerState[ip] = { upTime: 0, downTime: 0, status: 'Unknown', countdown: 0 };
   }
   const s = routerState[ip];
+  let justConfirmed = false;
 
   if (alive) {
     s.countdown = 0;
@@ -63,21 +75,31 @@ function updateState(ip, alive) {
     s.upTime   += 30;
     s.downTime  = 0;
   } else {
+    const wasBelowThreshold = s.countdown < COUNTDOWN_THRESHOLD;
     if (s.countdown < COUNTDOWN_THRESHOLD) s.countdown += 1;
 
     if (s.countdown < COUNTDOWN_THRESHOLD) {
-      // grace period — still reported as Up
+      // still in grace period — reported as Up for now
       s.status    = 'Up';
       s.upTime   += 30;
       s.downTime  = 0;
     } else {
-      // confirmed down
-      s.status    = 'Down';
-      s.downTime += 30;
-      s.upTime    = 0;
+      // confirmed down (countdown just hit, or already sitting at, threshold)
+      s.status = 'Down';
+      s.upTime = 0;
+
+      if (wasBelowThreshold) {
+        // this is the exact cycle the countdown reached the threshold —
+        // the whole grace window is now retroactively "was actually down"
+        justConfirmed = true;
+        s.downTime = COUNTDOWN_THRESHOLD * 30;
+      } else {
+        // already confirmed down previously, still down, keep growing
+        s.downTime += 30;
+      }
     }
   }
-  return s;
+  return { ...s, justConfirmed };
 }
 
 // ─── Get 24h up/down sums for ALL routers in ONE query ──────────────────────
@@ -100,6 +122,55 @@ async function get24hSumsForAll() {
     });
   }
   return map;
+}
+
+// ─── For a router that just got confirmed Down, find the 24h up/down ───────
+// ─── sums as they stood right BEFORE its grace period began (i.e. skip ─────
+// ─── over the THRESHOLD-1 rows that are about to be corrected) ─────────────
+async function getPreGraceSums(ip) {
+  const sql = `
+    SELECT up_time_last_24h, down_time_last_24h
+    FROM ping_history
+    WHERE ip_address = $1
+    ORDER BY checked_at DESC
+    OFFSET $2
+    LIMIT 1
+  `;
+  const res = await query(sql, [ip, COUNTDOWN_THRESHOLD - 1]);
+  if (res.rowCount === 0) return { up24: 0, down24: 0 }; // brand-new router, no history yet
+  return {
+    up24:   parseInt(res.rows[0].up_time_last_24h)   || 0,
+    down24: parseInt(res.rows[0].down_time_last_24h) || 0,
+  };
+}
+
+// ─── Retroactively flip the last (THRESHOLD-1) history rows for this IP ─────
+// ─── from Up → Down, now that the router has been confirmed Down. ──────────
+// ─── Uses a single UPDATE (window function) — one query per confirming ─────
+// ─── router, only on the rare cycle it happens. ─────────────────────────────
+async function correctGraceWindow(ip, preGrace) {
+  const graceRows = COUNTDOWN_THRESHOLD - 1;
+  if (graceRows <= 0) return;
+
+  const sql = `
+    WITH grace AS (
+      SELECT ctid, ROW_NUMBER() OVER (ORDER BY checked_at DESC) AS rn
+      FROM ping_history
+      WHERE ip_address = $1
+      ORDER BY checked_at DESC
+      LIMIT $2
+    )
+    UPDATE ping_history p
+    SET
+      status              = 'Down',
+      up_time             = 0,
+      down_time           = (($2 + 1) - grace.rn) * 30,
+      up_time_last_24h    = $3,
+      down_time_last_24h  = $4 + (($2 + 1) - grace.rn) * 30
+    FROM grace
+    WHERE p.ctid = grace.ctid
+  `;
+  await query(sql, [ip, graceRows, preGrace.up24, preGrace.down24]);
 }
 
 // ─── Build one multi-row UPSERT for router_status ────────────────────────────
@@ -193,7 +264,9 @@ async function runPingCycle() {
     allResults.push(...results);
   }
 
-  // ── Get 24h sums for all routers in ONE query ──
+  // ── Get 24h sums for all routers in ONE query (used for every router ──
+  // ── EXCEPT ones that just got confirmed Down this exact cycle — those ──
+  // ── use getPreGraceSums() instead, fetched further below) ──────────────
   let sums;
   try {
     sums = await get24hSumsForAll();
@@ -202,15 +275,45 @@ async function runPingCycle() {
     sums = new Map();
   }
 
-  // ── Update in-memory state + build row objects ──
-  const rows = allResults.map(r => {
+  // ── Pass 1: update in-memory state for every router, note which ──
+  // ── ones just crossed the confirmation threshold this cycle ──────
+  const updated = allResults.map(r => {
     const state = updateState(r.ip_address, r.alive);
-    const sum = sums.get(r.ip_address) || { up24: 0, down24: 0 };
-    const up24h   = sum.up24   + (state.status === 'Up'   ? 30 : 0);
-    const down24h = sum.down24 + (state.status === 'Down' ? 30 : 0);
+    return { ...r, state };
+  });
+  const justConfirmedIps = updated.filter(u => u.state.justConfirmed).map(u => u.ip_address);
+
+  // ── Pass 2: for any just-confirmed router, fetch the 24h sums as ──
+  // ── they stood BEFORE its grace period began (small extra query, ──
+  // ── only runs on the rare cycle a router flips to confirmed Down) ──
+  const preGraceMap = new Map();
+  for (const ip of justConfirmedIps) {
+    try {
+      preGraceMap.set(ip, await getPreGraceSums(ip));
+    } catch (err) {
+      console.error(`[PING ENGINE] Failed to get pre-grace sums for ${ip}:`, err.message);
+      preGraceMap.set(ip, { up24: 0, down24: 0 });
+    }
+  }
+
+  // ── Build final row objects for this cycle's batch insert ──
+  const rows = updated.map(r => {
+    const state = r.state;
+    let up24h, down24h;
+
+    if (state.justConfirmed) {
+      const base = preGraceMap.get(r.ip_address) || { up24: 0, down24: 0 };
+      up24h   = base.up24;                              // no Up growth during a down streak
+      down24h = base.down24 + COUNTDOWN_THRESHOLD * 30;  // whole confirmed window counted
+    } else {
+      const sum = sums.get(r.ip_address) || { up24: 0, down24: 0 };
+      up24h   = sum.up24   + (state.status === 'Up'   ? 30 : 0);
+      down24h = sum.down24 + (state.status === 'Down' ? 30 : 0);
+    }
 
     const symbol = r.alive ? '✔' : '✘';
-    console.log(`[PING] ${symbol} ${r.bts_name} (${r.ip_address}) | status=${state.status} | up=${state.upTime}s | down=${state.downTime}s | countdown=${state.countdown}`);
+    const tag = state.justConfirmed ? ' [CONFIRMED DOWN — correcting grace window]' : '';
+    console.log(`[PING] ${symbol} ${r.bts_name} (${r.ip_address}) | status=${state.status} | up=${state.upTime}s | down=${state.downTime}s | countdown=${state.countdown}${tag}`);
 
     return {
       bts_name:           r.bts_name,
@@ -232,7 +335,7 @@ async function runPingCycle() {
     console.error('[PING ENGINE] Batch upsert (router_status) failed:', err.message);
   }
 
-  // ── ONE batch write to ping_history ──
+  // ── ONE batch write to ping_history (this cycle's row for every router) ──
   try {
     const { sql, params } = buildBatchInsertHistory(rows, cycleTimestamp);
     await query(sql, params);
@@ -240,8 +343,22 @@ async function runPingCycle() {
     console.error('[PING ENGINE] Batch insert (ping_history) failed:', err.message);
   }
 
+  // ── Retroactive correction — only for routers that just got confirmed ──
+  // ── Down this cycle. Rare event, so a small extra query per router is ──
+  // ── negligible overhead compared to the 200-router batch above. ────────
+  for (const ip of justConfirmedIps) {
+    try {
+      const preGrace = preGraceMap.get(ip) || { up24: 0, down24: 0 };
+      await correctGraceWindow(ip, preGrace);
+      console.log(`[PING ENGINE] Corrected grace window for ${ip} — last ${COUNTDOWN_THRESHOLD - 1} rows flipped Up→Down`);
+    } catch (err) {
+      console.error(`[PING ENGINE] Failed to correct grace window for ${ip}:`, err.message);
+    }
+  }
+
   const elapsed = ((Date.now() - cycleStart) / 1000).toFixed(1);
-  console.log(`[PING ENGINE] ── Cycle done in ${elapsed}s (2 DB writes total)\n`);
+  const extraWrites = justConfirmedIps.length;
+  console.log(`[PING ENGINE] ── Cycle done in ${elapsed}s (2 DB writes${extraWrites ? ` + ${extraWrites} correction write(s)` : ''})\n`);
 }
 
 // ─── Start the engine ────────────────────────────────────────────────────────
@@ -251,6 +368,7 @@ async function start() {
   console.log(`  Batch size         : ${BATCH_SIZE} routers`);
   console.log(`  Countdown threshold: ${COUNTDOWN_THRESHOLD} cycles (= ${(COUNTDOWN_THRESHOLD * PING_INTERVAL_MS) / 1000}s to confirm Down)`);
   console.log(`  Ping timeout       : ${PING_TIMEOUT_S}s per ping`);
+  console.log(`  Retroactive correction: ON — grace window rows get corrected Up→Down when confirmed`);
 
   await runPingCycle();
 

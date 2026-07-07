@@ -222,10 +222,23 @@ router.get('/analytics/all', async (req, res) => {
       };
     });
 
+    // ── Which real-world dates this rolling window covers ──
+    // period=1d  -> single "date" (today, the moment of the call)
+    // period=7d/30d -> "start_date" to "end_date"
+    const now       = new Date();
+    const windowEnd = now.toISOString().slice(0, 10);
+    const dateInfo  = (days <= 1)
+      ? { date: windowEnd }
+      : {
+          start_date: new Date(now.getTime() - days * 86400000).toISOString().slice(0, 10),
+          end_date:   windowEnd,
+        };
+
     res.json({
       success:      true,
       period_days:  days,
       period_label: periodLabel(days),
+      ...dateInfo,
       count:        data.length,
       data,
     });
@@ -267,6 +280,12 @@ async function buildAndSendExcel(res, days, routersRes) {
 
   const reportDate     = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
   const periodLabelStr = days === 1 ? '1 Day' : days === 7 ? '7 Days' : '30 Days';
+
+  // ── Which real-world dates this rolling window covers ──
+  const now = new Date();
+  const dateLabel = (days <= 1)
+    ? `Date: ${now.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
+    : `Start Date: ${new Date(now.getTime() - days * 86400000).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}  |  End Date: ${now.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`;
 
   // ── Styles ──────────────────────────────────────────────
   const COMPANY_FONT = { name: 'Arial', size: 14, bold: true, color: { argb: 'FFFFFFFF' } };
@@ -325,7 +344,7 @@ async function buildAndSendExcel(res, days, routersRes) {
   // Row 3 — Report info
   ws.mergeCells('A3:I3');
   const r3 = ws.getCell('A3');
-  r3.value = `Analytics Report — ${periodLabelStr} Period  |  Generated: ${reportDate}`;
+  r3.value = `Analytics Report — ${periodLabelStr} Period  |  ${dateLabel}  |  Generated: ${reportDate}`;
   r3.font = DATE_FONT; r3.alignment = CENTER;
   r3.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE3F2FD' } };
   ws.getRow(3).height = 18;
@@ -1840,8 +1859,8 @@ router.post('/ask', async (req, res) => {
         const result = await query(sql);
         const answer = result.rowCount === 0
           ? 'All routers are currently Up. No routers are down.'
-          : `${result.rowCount} router(s) are currently Down:\n` +
-            result.rows.map(r => `- ${r.bts_name} (${r.ip_address}) — down for ${formatDuration(r.down_time)}`).join('\n');
+          : `${result.rowCount} routers are currently Down:\n` +
+            result.rows.map(r => `- ${r.bts_name} — down for ${formatDuration(r.down_time)}`).join('\n');
         return res.json({ success: true, question, intent, answer, data: result.rows });
       }
       case 'up_list': {
