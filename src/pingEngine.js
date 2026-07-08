@@ -335,25 +335,31 @@ async function runPingCycle() {
     console.error('[PING ENGINE] Batch upsert (router_status) failed:', err.message);
   }
 
+  // ── Retroactive correction — MUST run BEFORE this cycle's ping_history ──
+  // ── insert below. correctGraceWindow() selects "the last 9 rows for ──────
+  // ── this IP" — if the current cycle's new row were already inserted ─────
+  // ── first, that new row would occupy one of those 9 slots and push the ──
+  // ── oldest real grace row (countdown=1) out of the window, leaving it ────
+  // ── incorrectly stuck as 'Up' while rows 2–10 became 'Down'. Running ─────
+  // ── this first guarantees exactly rows 1–9 (the true grace window) get ──
+  // ── corrected, and the current cycle's own row (inserted next, below) ────
+  // ── becomes the 10th Down row. ────────────────────────────────────────────
+  for (const ip of justConfirmedIps) {
+    try {
+      const preGrace = preGraceMap.get(ip) || { up24: 0, down24: 0 };
+      await correctGraceWindow(ip, preGrace);
+      console.log(`[PING ENGINE] Corrected grace window for ${ip} — rows 1-${COUNTDOWN_THRESHOLD - 1} flipped Up→Down`);
+    } catch (err) {
+      console.error(`[PING ENGINE] Failed to correct grace window for ${ip}:`, err.message);
+    }
+  }
+
   // ── ONE batch write to ping_history (this cycle's row for every router) ──
   try {
     const { sql, params } = buildBatchInsertHistory(rows, cycleTimestamp);
     await query(sql, params);
   } catch (err) {
     console.error('[PING ENGINE] Batch insert (ping_history) failed:', err.message);
-  }
-
-  // ── Retroactive correction — only for routers that just got confirmed ──
-  // ── Down this cycle. Rare event, so a small extra query per router is ──
-  // ── negligible overhead compared to the 200-router batch above. ────────
-  for (const ip of justConfirmedIps) {
-    try {
-      const preGrace = preGraceMap.get(ip) || { up24: 0, down24: 0 };
-      await correctGraceWindow(ip, preGrace);
-      console.log(`[PING ENGINE] Corrected grace window for ${ip} — last ${COUNTDOWN_THRESHOLD - 1} rows flipped Up→Down`);
-    } catch (err) {
-      console.error(`[PING ENGINE] Failed to correct grace window for ${ip}:`, err.message);
-    }
   }
 
   const elapsed = ((Date.now() - cycleStart) / 1000).toFixed(1);
