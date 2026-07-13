@@ -1,5 +1,5 @@
 {
-  "name": "router-monitor",
+  "name": "router-monitor-backend",
   "version": "1.0.0",
   "description": "Production-grade router monitoring system with TimescaleDB",
   "main": "src/server.js",
