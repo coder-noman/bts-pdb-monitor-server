@@ -37,12 +37,14 @@ http://localhost:3000/api/analytics/date/2026-06-16
 http://localhost:3000/api/analytics/date/2026-06-16/10.200.205.2
 http://localhost:3000/api/analytics/range/all?start=2026-06-27&end=2026-07-01
 http://localhost:3000/api/analytics/range/10.200.205.2?start=2026-06-15&end=2026-06-16
+http://localhost:3000/api/analytics/yesterday
 
 Date Wise Analytics Excel report
 http://localhost:3000/api/analytics/date/2026-06-28/excel
 http://localhost:3000/api/analytics/date/2026-06-28/10.200.106.210/excel
 http://localhost:3000/api/analytics/range/all/excel?start=2026-06-27&end=2026-07-01
 http://localhost:3000/api/analytics/range/10.200.106.210/excel?start=2026-06-29&end=2026-07-01
+http://localhost:3000/api/analytics/yesterday/excel
 
 
 Month wise Analytics

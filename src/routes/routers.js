@@ -126,7 +126,7 @@ router.get('/:ip/history', async (req, res) => {
 // with started_at and ended_at (ended_at is null for the ongoing cycle).
 router.get('/:ip/last-events', async (req, res) => {
   const ip   = req.params.ip;
-  const limit  = parseInt(req.query.limit) || 100;
+  const limit  = parseInt(req.query.limit) || 300;
   const page   = parseInt(req.query.page)  || 1;
   const offset = (page - 1) * limit;
 
@@ -136,63 +136,63 @@ router.get('/:ip/last-events', async (req, res) => {
     const bts_name = check.rows[0].bts_name;
 
     // ── Count total cycles ──────────────────────────────
+    // A "cycle" starts wherever the status differs from the
+    // previous row (or it's the very first row ever).
     const countSQL = `
       WITH ranked AS (
-        SELECT status, checked_at,
-          LEAD(status) OVER (ORDER BY checked_at ASC) AS next_status
+        SELECT status,
+          LAG(status) OVER (ORDER BY checked_at ASC) AS prev_status
         FROM ping_history
         WHERE ip_address = $1
       )
       SELECT COUNT(*) AS total
       FROM ranked
-      WHERE next_status IS NULL OR next_status <> status
+      WHERE prev_status IS NULL OR prev_status <> status
     `;
     const countRes = await query(countSQL, [ip]);
     const total = parseInt(countRes.rows[0].total);
 
-    // ── Find cycle starts (LAG) and cycle ends (LEAD), ──
-    // ── pair the Nth start with the Nth end (cycles ────
-    // ── alternate Up/Down strictly, so this pairing is ──
-    // ── always correct) ─────────────────────────────────
+    // ── Group every consecutive same-status streak into one ──
+    // ── cycle (the "gaps and islands" technique) — this is a ──
+    // ── single self-contained calculation, so every cycle ─────
+    // ── (first or last, Up or Down) is always captured ────────
+    // ── correctly, with no separate lists that could ever ─────
+    // ── fall out of sync with each other. ──────────────────────
     const sql = `
       WITH ranked AS (
         SELECT bts_name, ip_address, up_time, down_time,
           up_time_last_24h, down_time_last_24h,
           status, countdown, checked_at,
-          LAG(status)  OVER (ORDER BY checked_at ASC) AS prev_status,
-          LEAD(status) OVER (ORDER BY checked_at ASC) AS next_status
+          LAG(status) OVER (ORDER BY checked_at ASC) AS prev_status
         FROM ping_history
         WHERE ip_address = $1
       ),
-      cycle_starts AS (
-        SELECT
-          checked_at AS started_at,
-          ROW_NUMBER() OVER (ORDER BY checked_at ASC) AS rn
+      grouped AS (
+        SELECT *,
+          SUM(CASE WHEN prev_status IS NULL OR prev_status <> status THEN 1 ELSE 0 END)
+            OVER (ORDER BY checked_at ASC) AS grp
         FROM ranked
-        WHERE prev_status IS NULL OR prev_status <> status
       ),
-      cycle_ends AS (
+      cycles AS (
         SELECT
-          bts_name, ip_address, up_time, down_time,
-          up_time_last_24h, down_time_last_24h,
-          status, countdown,
-          checked_at AS ended_at,
-          next_status,
-          ROW_NUMBER() OVER (ORDER BY checked_at ASC) AS rn
-        FROM ranked
-        WHERE next_status IS NULL OR next_status <> status
+          bts_name, ip_address, status, grp,
+          MIN(checked_at) AS started_at,
+          MAX(checked_at) AS last_seen_at,
+          (ARRAY_AGG(up_time            ORDER BY checked_at DESC))[1] AS up_time,
+          (ARRAY_AGG(down_time          ORDER BY checked_at DESC))[1] AS down_time,
+          (ARRAY_AGG(up_time_last_24h   ORDER BY checked_at DESC))[1] AS up_time_last_24h,
+          (ARRAY_AGG(down_time_last_24h ORDER BY checked_at DESC))[1] AS down_time_last_24h,
+          (ARRAY_AGG(countdown          ORDER BY checked_at DESC))[1] AS countdown
+        FROM grouped
+        GROUP BY bts_name, ip_address, status, grp
       )
       SELECT
-        ce.bts_name, ce.ip_address,
-        ce.up_time, ce.down_time,
-        ce.up_time_last_24h, ce.down_time_last_24h,
-        ce.status, ce.countdown,
-        cs.started_at,
-        CASE WHEN ce.next_status IS NULL THEN NULL ELSE ce.ended_at END AS ended_at,
-        (ce.next_status IS NULL) AS ongoing
-      FROM cycle_ends ce
-      JOIN cycle_starts cs ON cs.rn = ce.rn
-      ORDER BY ce.ended_at DESC
+        bts_name, ip_address, up_time, down_time,
+        up_time_last_24h, down_time_last_24h, status, countdown,
+        started_at,
+        CASE WHEN grp = MAX(grp) OVER () THEN NULL ELSE last_seen_at END AS ended_at
+      FROM cycles
+      ORDER BY grp DESC
       LIMIT $2 OFFSET $3
     `;
     const result = await query(sql, [ip, limit, offset]);
