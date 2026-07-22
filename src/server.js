@@ -1,4 +1,12 @@
-// src/server.js — Production Express server + Ping Engine bootstrap
+// src/server.js — Production Express API server ONLY
+//
+// This process handles HTTP requests exclusively — no ping engine,
+// no scheduler. Those live in src/pingWorker.js as a completely
+// separate, independent process.
+//
+// This means restarting/updating the API (adding endpoints, fixing
+// bugs in routers.js/analytics.js) never interrupts router monitoring
+// — the ping worker keeps running the whole time.
 
 require('dotenv').config();
 const express    = require('express');
@@ -8,8 +16,6 @@ const rateLimit  = require('express-rate-limit');
 const { testConnection } = require('./db');
 const routerRoutes = require('./routes/routers');
 const analyticsRoutes = require('./routes/analytics');
-const pingEngine   = require('./pingEngine');
-const scheduler    = require('./scheduler');
 
 const app  = express();
 const PORT = parseInt(process.env.PORT) || 3000;
@@ -62,7 +68,9 @@ process.on('unhandledRejection', err => console.error('[SERVER] Unhandled reject
 // ── Boot ──────────────────────────────────────
 async function boot() {
   console.log('═══════════════════════════════════════');
-  console.log('  Router Monitor — Production Server   ');
+  console.log('  Router Monitor — API Server            ');
+  console.log('  (Ping engine runs separately — see     ');
+  console.log('   src/pingWorker.js, run as its own process)      ');
   console.log('═══════════════════════════════════════');
 
   const dbOk = await testConnection();
@@ -75,13 +83,6 @@ async function boot() {
     console.log(`[SERVER] API listening on http://localhost:${PORT}`);
     console.log(`[SERVER] Environment: ${process.env.NODE_ENV}`);
   });
-
-  // Start ping engine in same process
-  await pingEngine.start();
-
-  // Start automatic nightly daily-summary scheduler
-  // (also self-heals any missed days right now on startup)
-  scheduler.start();
 }
 
 boot();
